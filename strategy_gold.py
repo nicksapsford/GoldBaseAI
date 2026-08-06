@@ -20,11 +20,16 @@ log = logging.getLogger("GoldTrader.Strategy")
 
 # ── Settings ──────────────────────────────────────────────────────────────────
 
-TRAILING_STOP_POINTS   = 30.0    # trailing stop in gold points ($/oz)
-TAKE_PROFIT_POINTS     = 50.0    # scalp target (System 3 Review, 18 Jul 2026): 150 was
-                                 # never hit (best-ever move 67pt); 50pt = 1.67:1 R:R,
-                                 # evidence-based, achievable. Backtest-provisional, 4-wk review.
-MAX_RISK_PER_TRADE_GBP = 20.0    # max GBP loss per trade (2% of £1,000)
+TRAILING_STOP_POINTS   = 40.0    # trailing stop in gold points ($/oz). GoldBase v1.0.2 (6 Aug 2026):
+                                 # widened 30->40 (Commission 019) -- the 30pt trail cut winners short
+                                 # (avg win ~20pt; only 3/21 wins reached >=45pt). 40pt lets winners
+                                 # breathe. MAX_RISK unchanged: stake auto-drops ~£0.67->£0.50/pt so a
+                                 # full stop still loses ~£20.
+TAKE_PROFIT_POINTS     = 90.0    # scalp target. GoldBase v1.0.2: raised 50->90 (Commission 019) -- the
+                                 # 50pt cap capped winners below Gold's real range (best-ever move 67pt);
+                                 # 90/40 = 2.25:1 R:R (was 1.67:1). Rarely hit by limit -- its job is to
+                                 # stop capping runners; the widened trail + softened ladder bank the move.
+MAX_RISK_PER_TRADE_GBP = 20.0    # max GBP loss per trade (2% of £1,000) -- UNCHANGED (v1.0.2)
 SPREAD_POINTS          = 0.3     # Capital.com gold spread (very low cost)
 DEFAULT_GBPUSD         = 1.27    # conservative fallback if live rate unavailable
 
@@ -121,13 +126,16 @@ def should_force_close(ts_utc: Optional[datetime] = None) -> bool:
 
 # ── Trade record ──────────────────────────────────────────────────────────────
 
-# Recalibrated for the 30pt stop / 50pt target scalp profile (System 3 Review,
-# 18 Jul 2026) at ~£0.67/pt: Step1 ~12pt, Step2 ~24pt (halfway), Step3 ~37pt
-# (approaching target). Step 4 removed -- with a 50pt target, Step 3 is sufficient.
+# SOFTENED for the 40pt stop / 90pt target profile (GoldBase v1.0.2, 6 Aug 2026, Commission 019).
+# The old 8/16/25 ladder clamped the stop too early and helped cut winners short. At the new
+# ~£0.50/pt stake (40pt stop) these triggers/floors are: rung1 £15->£8 (~30pt in, lock ~16pt),
+# rung2 £28->£18 (~56pt in, lock ~36pt), rung3 £40->£30 (~80pt in, approaching the 90pt target,
+# lock ~60pt). Locks nothing until the trade has a real cushion, then protects hard near target --
+# so a runner can breathe toward 90pt instead of being choked at the first rung.
 PROFIT_LADDER = [
-    {"trigger_gbp": 8.00,  "floor_gbp": 6.00},
-    {"trigger_gbp": 16.00, "floor_gbp": 13.00},
-    {"trigger_gbp": 25.00, "floor_gbp": 21.00},
+    {"trigger_gbp": 15.00, "floor_gbp": 8.00},
+    {"trigger_gbp": 28.00, "floor_gbp": 18.00},
+    {"trigger_gbp": 40.00, "floor_gbp": 30.00},
 ]
 
 
