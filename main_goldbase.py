@@ -241,6 +241,10 @@ def run_candle_tick(feed, stanley, account, ig):
     except Exception:
         bar_1d = None
     try:
+        df_1d = feed.get("1d")            # full daily frame -- v1.0.1 daily filter needs recent bars
+    except Exception:
+        df_1d = None
+    try:
         bar_1h = feed.latest_bar("1h")
         bar_5m = feed.latest_bar("5m")
     except Exception:
@@ -260,9 +264,9 @@ def run_candle_tick(feed, stanley, account, ig):
 
     signal_dir = ssl_agreement(bar_1d, bar_1h, bar_5m)
     _last["signal"] = signal_dir
-    checks = run_all_pre_checks(bar_1h, bar_5m, account, None, bar_1d,
+    checks = run_all_pre_checks(bar_1h, bar_5m, account, None, df_1d,
                                 proposed_direction=(signal_dir or "BOTH"), now_utc=now_utc)
-    _last["checks"] = run_individual_pre_checks(bar_1h, bar_5m, account, None, bar_1d,
+    _last["checks"] = run_individual_pre_checks(bar_1h, bar_5m, account, None, df_1d,
                                                 proposed_direction=(signal_dir or "BOTH"), now_utc=now_utc)
     _last["lancelot"] = "CLEAR" if checks.get("passed") else ("BLOCKED: " + str(checks.get("reason") or "--"))
 

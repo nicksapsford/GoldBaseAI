@@ -22,7 +22,11 @@ DAILY_LOSS_LIMIT_GBP    = 60.0   # 6% of £1,000 -- hard stop for the day
 MAX_CONSECUTIVE_LOSSES  = 5
 COOLDOWN_MINUTES        = 30
 MIN_TMO_FOR_ENTRY       = 0.3
-NO_ENTRY_AFTER_MIN      = 20 * 60 + 30   # 20:30 UTC -- no new entries within 30m of close
+NO_ENTRY_AFTER_MIN      = 20 * 60        # 20:00 UTC -- no new entries in the last hour (GoldBase v1.0.1;
+                                         # was 20:30 -- cuts thin, hard-to-manage late-session entries)
+CONSEC_BEAR_BARS_FOR_SHORT = 3   # GoldBase v1.0.1: a SHORT needs >=3 consecutive BEAR daily bars
+                                 # (sustained downtrend). A 1-day daily-BEAR flip no longer triggers
+                                 # SHORTs -- those bear-trap shorts cost -£48.53 live (Commission 019).
 
 RSI_LONG_NORMAL   = 52    # relaxed 55->52 (v1.0.6, backtest_gold validated)
 RSI_SHORT_NORMAL  = 48    # relaxed 45->48 (v1.0.6, backtest_gold validated)
@@ -147,12 +151,13 @@ def check_market_open(now_utc: Optional[datetime] = None) -> dict:
 
 
 def check_near_close(now_utc: Optional[datetime] = None) -> dict:
-    """No new entries after 20:30 UTC (within 30 min of the 21:00 daily close)."""
+    """No new entries after 20:00 UTC (within the last hour of the 21:00 daily close).
+    GoldBase v1.0.1: cutoff moved 20:30 -> 20:00 (late-entry cutoff, Commission 019)."""
     if now_utc is None:
         now_utc = datetime.now(timezone.utc)
     hm = now_utc.hour * 60 + now_utc.minute
     if NO_ENTRY_AFTER_MIN <= hm < 21 * 60:
-        return _fail("Within 30 min of daily close (after 20:30 UTC) -- no new entries.")
+        return _fail("Within the last hour before daily close (after 20:00 UTC) -- no new entries.")
     return _pass()
 
 
@@ -172,23 +177,46 @@ def check_liquidity_period(now_utc: Optional[datetime] = None) -> dict:
     return result
 
 
-def check_daily_trend_filter(bar_1d: Optional[pd.Series], direction: str) -> dict:
-    """Bidirectional daily filter (System 3 Review, 18 Jul 2026). The daily SSL sets
-    the primary bias, but LONG bounce trades ARE permitted in a BEAR daily (the missed
-    +94pt of 9 Jul). Rules:
-      BULL daily -> LONG only  (never SHORT into a bull daily).
-      BEAR daily -> SHORT (trend resumption) OR cautious LONG bounce -- the Morgan>=60
-                    SHORT gate (main) + 1h/5m SSL alignment do the fine-grained gating.
-      NEUTRAL / no data -> both allowed."""
-    if bar_1d is None:
-        return _pass()
-    ssl_1d = bar_1d.get("ssl_bull")
-    if pd.isna(ssl_1d):
-        return _pass()
-    if ssl_1d and direction == "SHORT":
+def _daily_ssl_series(df_1d) -> list:
+    """Recent daily ssl_bull values as bools, oldest->newest, NaNs dropped.
+    Returns [] when the daily frame / column is missing or entirely NaN."""
+    if df_1d is None:
+        return []
+    try:
+        s = df_1d["ssl_bull"].dropna()
+    except Exception:
+        return []
+    return [bool(v) for v in s.tolist()]
+
+
+def check_daily_trend_filter(df_1d, direction: str) -> dict:
+    """Bidirectional daily filter (System 3 Review 18 Jul 2026; GoldBase v1.0.1, 6 Aug 2026).
+    The daily SSL sets the primary bias. LONG bounce trades ARE permitted in a BEAR daily
+    (the missed +94pt of 9 Jul), so LONG is never blocked here. SHORTs are gated hard
+    (Commission 019 -- the bear-trap shorts cost -£48.53 live in Gold's uptrend):
+      BULL daily          -> LONG only (never SHORT into a bull daily).
+      BEAR daily          -> SHORT allowed ONLY after >=CONSEC_BEAR_BARS_FOR_SHORT consecutive
+                             BEAR daily bars (sustained downtrend). A 1-day BEAR flip does NOT
+                             trigger SHORTs.
+      missing / NaN daily -> LONG allowed; SHORT BLOCKED (fail CLOSED, v1.0.1 -- previously this
+                             failed OPEN and let ungated SHORTs through on a daily-data hiccup).
+    GoldBase-only change; GoldBenchmark keeps the original fail-open filter (scientific control)."""
+    if direction != "SHORT":
+        return _pass()   # LONG is never blocked by the daily filter (bounce LONGs permitted)
+
+    series = _daily_ssl_series(df_1d)
+    if not series:
+        return _fail("Daily SSL data missing/NaN -- SHORT blocked (fail-closed, v1.0.1).",
+                     block_direction="SHORT")
+    if series[-1]:  # latest daily bar is BULL
         return _fail("Daily SSL is BULL -- no SHORTs into a bull daily (LONG bias today).",
                      block_direction="SHORT")
-    # BEAR daily no longer blocks LONG -- cautious bounce LONGs are permitted.
+    recent = series[-CONSEC_BEAR_BARS_FOR_SHORT:]
+    if len(recent) < CONSEC_BEAR_BARS_FOR_SHORT or any(recent):
+        return _fail(
+            "Daily BEAR not sustained (need %d consecutive BEAR daily bars; a 1-day flip does "
+            "not trigger SHORTs) -- SHORT blocked (v1.0.1)." % CONSEC_BEAR_BARS_FOR_SHORT,
+            block_direction="SHORT")
     return _pass()
 
 
@@ -292,11 +320,12 @@ def run_all_pre_checks(
     bar_5m: pd.Series,
     account,
     current_trade=None,
-    bar_1d: Optional[pd.Series] = None,
+    df_1d: Optional[pd.DataFrame] = None,
     proposed_direction: str = "BOTH",
     now_utc: Optional[datetime] = None,
 ) -> dict:
-    """Run all pre-checks in order, returning on first failure. Arthur is called only if passed."""
+    """Run all pre-checks in order, returning on first failure. Arthur is called only if passed.
+    df_1d is the full daily frame (v1.0.1) -- the daily filter needs recent bars, not just the last."""
     if now_utc is None:
         now_utc = datetime.now(timezone.utc)
     log.info("--- Lancelot running pre-checks ---")
@@ -324,7 +353,7 @@ def run_all_pre_checks(
     if current_trade is None:
         direction = _derive_direction(bar_1h, proposed_direction)
         quality_checks = [
-            ("Daily trend filter", lambda: check_daily_trend_filter(bar_1d, direction)),
+            ("Daily trend filter", lambda: check_daily_trend_filter(df_1d, direction)),
             ("SSL agreement 1h+5m", lambda: check_ssl_agreement(bar_1h, bar_5m, direction)),
             ("1h RSI confirming",  lambda: check_1h_rsi_confirms(bar_1h, direction, is_asian)),
             ("5m TMO momentum",    lambda: check_5m_tmo_momentum(bar_1h, bar_5m)),
@@ -347,7 +376,7 @@ def run_individual_pre_checks(
     bar_5m: pd.Series,
     account,
     current_trade=None,
-    bar_1d: Optional[pd.Series] = None,
+    df_1d: Optional[pd.DataFrame] = None,
     proposed_direction: str = "BOTH",
     now_utc: Optional[datetime] = None,
 ) -> dict:
@@ -364,7 +393,7 @@ def run_individual_pre_checks(
     checks["Market Open"]           = check_market_open(now_utc)["passed"]
     checks["Not Near Close"]        = check_near_close(now_utc)["passed"]
     if current_trade is None:
-        checks["Daily Trend OK"]    = check_daily_trend_filter(bar_1d, direction)["passed"]
+        checks["Daily Trend OK"]    = check_daily_trend_filter(df_1d, direction)["passed"]
         checks["SSL Aligned 1h+5m"] = check_ssl_agreement(bar_1h, bar_5m, direction)["passed"]
         checks["1h RSI Confirming"] = check_1h_rsi_confirms(bar_1h, direction, is_asian)["passed"]
         checks["Momentum Strong"]   = check_5m_tmo_momentum(bar_1h, bar_5m)["passed"]
