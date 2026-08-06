@@ -28,8 +28,17 @@ TRAILING_STOP_POINTS   = 40.0    # trailing stop in gold points ($/oz). GoldBase
 TAKE_PROFIT_POINTS     = 90.0    # scalp target. GoldBase v1.0.2: raised 50->90 (Commission 019) -- the
                                  # 50pt cap capped winners below Gold's real range (best-ever move 67pt);
                                  # 90/40 = 2.25:1 R:R (was 1.67:1). Rarely hit by limit -- its job is to
-                                 # stop capping runners; the widened trail + softened ladder bank the move.
+                                 # stop capping runners; the two-speed trail (v1.0.3) banks the move.
 MAX_RISK_PER_TRADE_GBP = 20.0    # max GBP loss per trade (2% of £1,000) -- UNCHANGED (v1.0.2)
+
+# Two-speed trailing stop (GoldBase v1.0.3, 6 Aug 2026). REPLACES the profit ladder. A 71-day paired
+# backtest (Commission 019) found every discrete ladder cost net P&L vs a variable trail, and this
+# accelerating trail was the best-performing option (beat the shipped 3-rung and a finer 5-rung). The
+# wide 40pt trail lets a trade prove itself; once +30pt in profit it tightens to a 10pt trail to bank
+# the climb -- captures the stall-and-reverse winners the coarse ladder handed back. Initial stop stays
+# 40pt (sizing/risk basis unchanged; the tight trail only applies once well in profit).
+TIGHT_TRAIL_ACTIVATE_POINTS = 30.0   # profit (pt) at which the trail tightens 40 -> 10
+TIGHT_TRAIL_POINTS          = 10.0   # tight trailing distance (pt) after activation
 SPREAD_POINTS          = 0.3     # Capital.com gold spread (very low cost)
 DEFAULT_GBPUSD         = 1.27    # conservative fallback if live rate unavailable
 
@@ -126,17 +135,12 @@ def should_force_close(ts_utc: Optional[datetime] = None) -> bool:
 
 # ── Trade record ──────────────────────────────────────────────────────────────
 
-# SOFTENED for the 40pt stop / 90pt target profile (GoldBase v1.0.2, 6 Aug 2026, Commission 019).
-# The old 8/16/25 ladder clamped the stop too early and helped cut winners short. At the new
-# ~£0.50/pt stake (40pt stop) these triggers/floors are: rung1 £15->£8 (~30pt in, lock ~16pt),
-# rung2 £28->£18 (~56pt in, lock ~36pt), rung3 £40->£30 (~80pt in, approaching the 90pt target,
-# lock ~60pt). Locks nothing until the trade has a real cushion, then protects hard near target --
-# so a runner can breathe toward 90pt instead of being choked at the first rung.
-PROFIT_LADDER = [
-    {"trigger_gbp": 15.00, "floor_gbp": 8.00},
-    {"trigger_gbp": 28.00, "floor_gbp": 18.00},
-    {"trigger_gbp": 40.00, "floor_gbp": 30.00},
-]
+# RETIRED in GoldBase v1.0.3 (6 Aug 2026, Commission 019 backtest). The discrete profit ladder is
+# replaced by the two-speed trailing stop (see TIGHT_TRAIL_* above + update_trailing_stop). A 71-day
+# paired backtest found every ladder variant cost net P&L vs a variable trail, and the two-speed trail
+# was the best-performing option. Left EMPTY (not deleted) so apply_profit_ladder + its CSV plumbing
+# stay dormant rather than removed -- re-enable by repopulating this list.
+PROFIT_LADDER = []
 
 
 @dataclass
@@ -215,21 +219,31 @@ class GoldTrade:
                     "stop_before": round(stop_before, 2), "stop_after": self.stop_loss}
         return None
 
+    def _trail_distance(self, best_profit_pts: float) -> float:
+        """Two-speed trail (GoldBase v1.0.3): wide 40pt until the trade proves itself
+        (+TIGHT_TRAIL_ACTIVATE_POINTS), then a tight TIGHT_TRAIL_POINTS trail to bank the
+        climb. best_profit_pts is the favourable excursion from entry (>=0)."""
+        return self.stop_pts if best_profit_pts < TIGHT_TRAIL_ACTIVATE_POINTS else TIGHT_TRAIL_POINTS
+
     def update_trailing_stop(self, price: float) -> bool:
-        """Move the stop in favour of the trade. Returns True if moved."""
+        """Move the stop in favour of the trade using the two-speed trail. Returns True if moved."""
         if self.direction == "LONG" and price > self.trail_best:
             self.trail_best = price
-            new_sl = price - self.stop_pts
+            trail = self._trail_distance(self.trail_best - self.entry_price)
+            new_sl = price - trail
             if new_sl > self.stop_loss:
                 self.stop_loss = round(new_sl, 2)
-                log.info("  Trailing stop moved UP to %.2f (price=%.2f)", self.stop_loss, price)
+                log.info("  Trailing stop moved UP to %.2f (price=%.2f, trail=%.0fpt)",
+                         self.stop_loss, price, trail)
                 return True
         elif self.direction == "SHORT" and price < self.trail_best:
             self.trail_best = price
-            new_sl = price + self.stop_pts
+            trail = self._trail_distance(self.entry_price - self.trail_best)
+            new_sl = price + trail
             if new_sl < self.stop_loss:
                 self.stop_loss = round(new_sl, 2)
-                log.info("  Trailing stop moved DOWN to %.2f (price=%.2f)", self.stop_loss, price)
+                log.info("  Trailing stop moved DOWN to %.2f (price=%.2f, trail=%.0fpt)",
+                         self.stop_loss, price, trail)
                 return True
         return False
 
