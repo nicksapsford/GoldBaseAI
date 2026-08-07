@@ -139,6 +139,17 @@ def notify_calendar_block(event_name, mins_remaining) -> None:
     )
 
 
+def notify_two_speed_activated(activation_pts, locked_gbp, stop_price) -> None:
+    """Two-speed trail engaged -- profit now locked (brief Part 5)."""
+    _send(
+        title   = "[GOLD] Profit Locked -- two-speed trail",
+        message = (
+            f"Two-speed trail activated at +{activation_pts:.0f}pt profit.\n"
+            f"Locked: +£{locked_gbp:.2f}\nStop now: ${stop_price:,.2f}"
+        ),
+    )
+
+
 def notify_daily_summary(date_str, trades, pnl_gbp, capital, win_rate) -> None:
     _send(
         title   = f"[GOLD] Daily Summary {date_str}",

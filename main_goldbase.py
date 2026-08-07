@@ -37,10 +37,11 @@ from capitalcom_connector import CapitalComConnector
 from notifier_gold import (
     notify_system_startup, notify_trade_opened,
     notify_trade_closed_win, notify_trade_closed_loss, notify_system_error,
+    notify_two_speed_activated,
 )
 from paper_trader_gold import PaperTraderGold, TRADES_LOG
 from pre_checks_gold import run_all_pre_checks, run_individual_pre_checks, check_kill_switch_reset
-from strategy_gold import should_force_close, get_gbpusd_rate
+from strategy_gold import should_force_close, get_gbpusd_rate, TIGHT_TRAIL_ACTIVATE_POINTS
 import direction_switch
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -211,6 +212,21 @@ def _on_close(stanley, account, price, reason):
              trade.direction, price, reason, trade.points_gained, trade.pnl_gbp, account.capital_gbp)
 
 
+def _maybe_notify_two_speed(trade) -> None:
+    """Fire a one-time Pushover when the two-speed trail first engages (brief Part 5). Silent on
+    paper (LIVE_NOTIFICATIONS gate in _send); one-shot via a flag on the trade."""
+    if trade is None or getattr(trade, "_two_speed_notified", False):
+        return
+    best = (trade.trail_best - trade.entry_price) if trade.direction == "LONG" else (trade.entry_price - trade.trail_best)
+    if best >= TIGHT_TRAIL_ACTIVATE_POINTS:
+        locked_pts = (trade.stop_loss - trade.entry_price) if trade.direction == "LONG" else (trade.entry_price - trade.stop_loss)
+        try:
+            notify_two_speed_activated(TIGHT_TRAIL_ACTIVATE_POINTS, max(locked_pts, 0.0) * getattr(trade, "stake", 0.0), trade.stop_loss)
+        except Exception as exc:
+            log.warning("two-speed notify failed: %s", exc)
+        trade._two_speed_notified = True
+
+
 def monitor(feed, stanley, account, ig, now_utc):
     if not stanley.in_trade:
         return
@@ -225,6 +241,8 @@ def monitor(feed, stanley, account, ig, now_utc):
     reason = stanley.monitor_trade(price, gbpusd)   # trailing + ladder + stop/target
     if reason:
         _on_close(stanley, account, price, reason)
+    else:
+        _maybe_notify_two_speed(stanley.current_trade)
 
 
 def run_candle_tick(feed, stanley, account, ig):
