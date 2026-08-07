@@ -25,12 +25,19 @@ log = logging.getLogger("GoldTrader.Percival")
 _PUSHOVER_API = "https://api.pushover.net/1/messages.json"
 _USER         = os.getenv("PUSHOVER_USER_KEY",  "")
 _TOKEN        = os.getenv("PUSHOVER_API_TOKEN", "")
+# LIVE_NOTIFICATIONS (.env, per-machine): True on K1 live only. Default False -> Dell paper is SILENT
+# for ALL trade notifications (brief Part 5). Hardware/process alerts come from the System Monitor,
+# which is separate and unaffected by this flag.
+_LIVE_NOTIFICATIONS = os.getenv("LIVE_NOTIFICATIONS", "False").strip().lower() in ("1", "true", "yes", "on")
 
 _P_NORMAL = 0
 _P_HIGH   = 1
 
 
 def _send(title: str, message: str, priority: int = _P_NORMAL) -> None:
+    if not _LIVE_NOTIFICATIONS:
+        log.debug("LIVE_NOTIFICATIONS off (paper) -- suppressed: %s", title)
+        return
     if not _USER or not _TOKEN:
         log.debug("Pushover not configured -- skipping: %s", title)
         return
