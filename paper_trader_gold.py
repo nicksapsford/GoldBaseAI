@@ -227,7 +227,9 @@ class PaperTraderGold:
         """Open a new paper trade and log it."""
         from strategy_gold import open_trade
         self._gbpusd = gbpusd
-        self.current_trade = open_trade(direction, price, gbpusd, liquidity_period)
+        # Pass current balance for K1 compounding (USE_COMPOUNDING); ignored when fixed (paper).
+        self.current_trade = open_trade(direction, price, gbpusd, liquidity_period,
+                                        balance=self.capital_gbp)
         self._save_state()
         log.info(
             "[OPEN] %s | entry=$%.2f | size=%.2foz | stake=£%.4f/pt | stop=$%.2f | target=$%.2f",

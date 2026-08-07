@@ -12,9 +12,16 @@ Sizing (confirmed/approved settings):
 """
 
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
+
+try:   # .env-driven flags (per-machine); loaded here so module-level config sees them
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except Exception:
+    pass
 
 log = logging.getLogger("GoldTrader.Strategy")
 
@@ -39,6 +46,18 @@ MAX_RISK_PER_TRADE_GBP = 20.0    # max GBP loss per trade (2% of £1,000) -- UNC
 # 40pt (sizing/risk basis unchanged; the tight trail only applies once well in profit).
 TIGHT_TRAIL_ACTIVATE_POINTS = 30.0   # profit (pt) at which the trail tightens 40 -> 10
 TIGHT_TRAIL_POINTS          = 10.0   # tight trailing distance (pt) after activation
+
+# Compounding position sizing (GoldBase v1.0.5, K1 live ONLY -- .env-driven, paper-safe defaults).
+# Dell paper: USE_COMPOUNDING=False -> fixed MAX_RISK_PER_TRADE_GBP stake (UNCHANGED, clean comparison).
+# K1 live .env sets USE_COMPOUNDING=True -> risk RISK_PCT of the CURRENT balance per trade (capped at
+# MAX_RISK_PCT), stake = risk / stop_distance, rounded to £0.50 (Capital.com min), floored at MIN_STAKE.
+def _envf(name, default):
+    try: return float(os.getenv(name, str(default)))
+    except Exception: return float(default)
+USE_COMPOUNDING = os.getenv("USE_COMPOUNDING", "False").strip().lower() in ("1", "true", "yes", "on")
+RISK_PCT        = _envf("RISK_PCT", 0.02)      # 2% of current balance per trade
+MAX_RISK_PCT    = _envf("MAX_RISK_PCT", 0.05)  # hard safety cap 5%
+MIN_STAKE       = _envf("MIN_STAKE", 0.50)     # Capital.com minimum £/pt
 SPREAD_POINTS          = 0.3     # Capital.com gold spread (very low cost)
 DEFAULT_GBPUSD         = 1.27    # conservative fallback if live rate unavailable
 
@@ -86,6 +105,17 @@ def calculate_size(stop_pts: float = TRAILING_STOP_POINTS,
     if stop_pts <= 0:
         return 0.0
     return round(risk_gbp * gbpusd / stop_pts, 2)
+
+
+def calculate_compounding_stake(balance: float, stop_pts: float = TRAILING_STOP_POINTS) -> float:
+    """K1 live fixed-fractional stake (£/pt): risk RISK_PCT of the CURRENT balance (capped at
+    MAX_RISK_PCT), stake = risk / stop, rounded to nearest £0.50, floored at MIN_STAKE.
+    Gold is oz-based, so the caller derives size_oz = stake * gbpusd from this £/pt stake."""
+    if stop_pts <= 0 or balance <= 0:
+        return MIN_STAKE
+    risk_amount = min(balance * RISK_PCT, balance * MAX_RISK_PCT)
+    stake = round((risk_amount / stop_pts) * 2) / 2   # nearest £0.50
+    return max(stake, MIN_STAKE)
 
 
 def calculate_stake(stop_pts: float = TRAILING_STOP_POINTS,
@@ -156,10 +186,15 @@ class GoldTrade:
     gbpusd_entry:     float = DEFAULT_GBPUSD
     entry_time:       object = field(default=None)
     liquidity_period: str    = field(default="")
+    balance:          float  = field(default=0.0)   # current balance at entry (K1 compounding); 0 = fixed
 
     def __post_init__(self):
-        if self.size_oz <= 0:
-            self.size_oz = calculate_size(self.stop_pts, self.gbpusd_entry)
+        if self.size_oz <= 0:                        # size only at NEW entry (reloaded trades keep size)
+            if USE_COMPOUNDING and self.balance and self.balance > 0:
+                stake = calculate_compounding_stake(self.balance, self.stop_pts)
+                self.size_oz = round(stake * self.gbpusd_entry, 4)          # oz from the £/pt stake
+            else:
+                self.size_oz = calculate_size(self.stop_pts, self.gbpusd_entry)   # fixed MAX_RISK (paper)
         self.stake        = round(self.size_oz / self.gbpusd_entry, 4) if self.gbpusd_entry > 0 else 0.0
         self.trail_best   = self.entry_price
         self.stop_loss    = calculate_stop_loss(self.entry_price, self.direction, self.stop_pts)
@@ -293,7 +328,8 @@ class GoldTrade:
 # ── Open / close helpers ──────────────────────────────────────────────────────
 
 def open_trade(direction: str, price: float, gbpusd: float,
-               liquidity_period: str = "", stop_pts: float = TRAILING_STOP_POINTS) -> GoldTrade:
+               liquidity_period: str = "", stop_pts: float = TRAILING_STOP_POINTS,
+               balance: float = 0.0) -> GoldTrade:
     trade = GoldTrade(
         direction        = direction,
         entry_price      = round(price, 2),
@@ -301,6 +337,7 @@ def open_trade(direction: str, price: float, gbpusd: float,
         gbpusd_entry     = gbpusd,
         entry_time       = datetime.now(timezone.utc),
         liquidity_period = liquidity_period,
+        balance          = balance,
     )
     log.info(
         ">>> TRADE OPENED | %s | entry=$%.2f | size=%.2foz | stake=£%.4f/pt | "
