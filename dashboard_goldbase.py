@@ -21,6 +21,20 @@ LOG_DIR = BASE_DIR / "logs"
 SHUTDOWN_FLAG = LOG_DIR / "shutdown.flag"
 _VER = BASE_DIR / "VERSION"
 APP_VERSION = _VER.read_text().strip() if _VER.exists() else "1.0.0"
+
+# ── Environment label (Part 2a): TEST (Dell, amber) / LIVE (K1, green). Set ENV_LABEL in .env. ──
+try:
+    from dotenv import load_dotenv
+    load_dotenv(BASE_DIR / ".env")
+except Exception:
+    pass
+ENV_LABEL = os.getenv("ENV_LABEL", "TEST").strip().upper()
+if ENV_LABEL == "LIVE":
+    _ENV_BADGE = ('<span style="background:#12331b;color:#3fb950;border:1px solid #2ea043;border-radius:5px;'
+                  'padding:3px 10px;font-size:11px;font-weight:700;letter-spacing:1px;">LIVE &mdash; K1</span>')
+else:
+    _ENV_BADGE = ('<span style="background:#3a2f00;color:#e0b020;border:1px solid #6b5600;border-radius:5px;'
+                  'padding:3px 10px;font-size:11px;font-weight:700;letter-spacing:1px;">TEST &mdash; Dell</span>')
 PORT = 5033
 
 logging.basicConfig(level=logging.WARNING)
@@ -67,6 +81,7 @@ table.tr td{padding:6px 8px;border-bottom:1px solid rgba(255,255,255,0.04);}
   <div class="brand">GOLD<span style="color:#fff">BENCHMARK</span> A.I.
     <small>__VER__ &middot; port 5033 &middot; Gold XAU/USD &middot; Lancelot + 3-TF SSL + switch</small></div>
   <div class="nav">
+    __ENV__
     <button class="navbtn" id="toPnl" onclick="showPage(2)">P&amp;L &rarr;</button>
     <div class="clock" id="clock">--:--:-- UTC</div>
   </div>
@@ -191,7 +206,7 @@ def _read_trades(path, limit=300):
 
 @app.route("/")
 def index():
-    return HTML.replace("__VER__", "v" + APP_VERSION)
+    return HTML.replace("__VER__", "v" + APP_VERSION).replace("__ENV__", _ENV_BADGE)
 
 
 @app.route("/api/update", methods=["POST"])
