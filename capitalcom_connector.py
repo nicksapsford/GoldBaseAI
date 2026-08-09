@@ -123,6 +123,11 @@ class CapitalComConnector:
     def connected(self) -> bool:
         return self._connected
 
+    @property
+    def account_type(self) -> str:
+        """DEMO or LIVE, from CAPITALCOM_ACC_TYPE (read-only; drives the dashboard account tag)."""
+        return (self._acc_type or "DEMO").strip().upper()
+
     def _refresh_session(self) -> None:
         """Re-authenticate if the session is missing or older than SESSION_MAX_AGE_S."""
         if self._session_created_at is None:

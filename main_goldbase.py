@@ -303,7 +303,30 @@ def run_candle_tick(feed, stanley, account, ig):
 
 # ── Dashboard push ────────────────────────────────────────────────────────────
 
-def push_dashboard(stanley, account, mode):
+# ── Account balance (Part 3, READ-ONLY) ───────────────────────────────────────
+# TOTAL POT = the real Capital.com account balance (demo now, live later). Cached 60s so we never
+# hammer the /accounts endpoint. NEVER places an order -- pure read. 2% of it = risk budget per trade.
+_bal_cache = {"ts": 0.0, "balance": None}
+
+
+def get_account_pot(ig):
+    """Return (balance_or_None, acc_type). Cached 60s; keeps last-good on a transient API failure."""
+    acc_type = ig.account_type if ig is not None else "DEMO"
+    now = time.time()
+    if _bal_cache["balance"] is not None and (now - _bal_cache["ts"]) < 60:
+        return _bal_cache["balance"], acc_type
+    bal = None
+    try:
+        if ig is not None and ig.connected:
+            bal = ig.get_account_balance()
+    except Exception:
+        bal = None
+    if bal is not None:
+        _bal_cache.update(ts=now, balance=bal)
+    return _bal_cache["balance"], acc_type
+
+
+def push_dashboard(stanley, account, mode, ig=None):
     trade = stanley.current_trade
     price = _last.get("price")
     pos, floating, locked = None, 0.0, None
@@ -324,8 +347,12 @@ def push_dashboard(stanley, account, mode):
                "stake": round(trade.stake, 2), "floating_gbp": floating,
                "ladder_step": getattr(trade, "ladder_step", 0), "locked_gbp": locked}
     lanc = "IN TRADE" if stanley.in_trade else _last.get("lancelot", "--")
+    pot, acc_type = get_account_pot(ig)
+    risk = round(pot * 0.02, 2) if pot else None
     payload = {
         "system": "GoldBase", "version": VERSION, "port": PORT,
+        "account_balance": pot, "account_type": acc_type,
+        "risk_per_trade": risk, "total_pot": pot,
         "mode": mode, "session": _last.get("session", "--"),
         "updated_utc": datetime.now(timezone.utc).strftime("%H:%M:%S"),
         "price": round(price, 2) if price is not None else None,
@@ -418,7 +445,7 @@ def main() -> None:
                 last_candle = now
 
             if (now - last_push) >= 15:
-                push_dashboard(stanley, account, direction_switch.get_mode())
+                push_dashboard(stanley, account, direction_switch.get_mode(), ig)
                 last_push = now
 
             time.sleep(2)
