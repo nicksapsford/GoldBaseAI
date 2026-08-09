@@ -317,8 +317,11 @@ def get_account_pot(ig):
         return _bal_cache["balance"], acc_type
     bal = None
     try:
-        if ig is not None and ig.connected:
-            bal = ig.get_account_balance()
+        if ig is not None:
+            if not ig.connected:
+                ig.connect()          # self-heal a failed startup connect (engine may be on yfinance fallback)
+            if ig.connected:
+                bal = ig.get_account_balance()
     except Exception:
         bal = None
     if bal is not None:
