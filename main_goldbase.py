@@ -39,7 +39,8 @@ from notifier_gold import (
     notify_trade_closed_win, notify_trade_closed_loss, notify_system_error,
     notify_two_speed_activated,
 )
-from paper_trader_gold import PaperTraderGold, TRADES_LOG
+from paper_trader_gold import PaperTraderGold, TRADES_LOG, LIVE_EXECUTION as _LIVE_EXECUTION
+import live_executor
 from pre_checks_gold import run_all_pre_checks, run_individual_pre_checks, check_kill_switch_reset
 from strategy_gold import should_force_close, get_gbpusd_rate, TIGHT_TRAIL_ACTIVATE_POINTS
 import direction_switch
@@ -184,6 +185,14 @@ _last = {"price": None, "signal": None, "lancelot": "awaiting first tick",
 
 def _open(stanley, ig, direction, price, period, gbpusd):
     trade = stanley.open_trade(direction, price, gbpusd, period)
+    if trade is None:
+        # STAGE B: the real demo order was refused/failed -> stay FLAT, alert, do NOT retry.
+        try:
+            notify_system_error("GoldBase: demo order placement FAILED -- staying flat (no auto-retry).")
+        except Exception:
+            pass
+        log.error("OPEN FAILED: real demo order not placed -- remaining FLAT.")
+        return
     try:
         notify_trade_opened(direction=direction, entry_price=price, stop_loss=trade.stop_loss,
                             take_profit=trade.take_profit, stake=trade.stake,
@@ -339,6 +348,11 @@ def push_dashboard(stanley, account, mode, ig=None):
             floating = round(pts * trade.stake, 2)
         except Exception:
             floating = 0.0
+        # STAGE B: show the REAL floating P&L from Capital.com (matches the account incl. spread) when live.
+        if _LIVE_EXECUTION and ig is not None:
+            _live_float = live_executor.position_pnl(ig, GOLD_EPIC)
+            if _live_float is not None:
+                floating = _live_float
         # Locked profit = guaranteed GBP if the stop fires now (stop past entry). GoldBase v1.0.4:
         # derive from stop-vs-entry, NOT the retired ladder's ladder_floor_gbp -- the two-speed
         # trail (v1.0.3) locks via the stop itself, so the old field stayed 0 and under-reported.
@@ -399,6 +413,15 @@ def main() -> None:
         log.warning("Initial data load partial: %s", exc)
 
     stanley = PaperTraderGold()
+    # ── STAGE B: attach the connector so Stanley can place/close REAL demo orders, then reconcile any
+    # restored open position against Capital.com (so a restart never leaves us managing a phantom). ──
+    stanley.ig = ig if ig_connected else None
+    stanley.reconcile_live_position()
+    if _LIVE_EXECUTION:
+        log.warning("*** STAGE B LIVE EXECUTION ON -- REAL demo orders will be placed on the "
+                    "Capital.com %s account. ***", (ig.account_type if ig_connected else "?"))
+    else:
+        log.info("Stage B live execution OFF (LIVE_EXECUTION=False) -- paper simulation only.")
     account = AccountState(capital=stanley.capital_gbp)
     # Today P&L Persist Fix (30 Jul 2026): seed the in-memory daily tally from today's
     # closed trades so a mid-day restart keeps the 'today' figure instead of resetting to 0.

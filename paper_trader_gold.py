@@ -7,6 +7,7 @@ Persists state between sessions via logs/gold_trades.csv.
 import csv
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -14,10 +15,19 @@ from typing import Optional
 import pandas as pd
 
 from strategy_gold import GoldTrade, TRAILING_STOP_POINTS, DEFAULT_GBPUSD
+from live_executor import place_order, close_order, existing_position
 
 log = logging.getLogger("GoldTrader.Stanley")
 
 STARTING_CAPITAL_GBP = 1000.0
+
+# ── Stage B: REAL Capital.com demo-order execution (replaces Stanley's simulation) ──
+# Default OFF in code (safe); enabled per-system via .env LIVE_EXECUTION=True. When ON, open_trade
+# places a REAL demo order and close_trade closes it; realised P&L is taken from the account balance
+# delta. All order placement fails CLOSED (see live_executor: DEMO guard + double-entry guard).
+LIVE_EXECUTION = os.getenv("LIVE_EXECUTION", "False").strip().lower() in ("1", "true", "yes", "on")
+LIVE_EPIC      = "GOLD"     # Capital.com epic for the real order (matches GOLD_EPIC in data_feed_gold)
+
 LOG_DIR      = Path(__file__).parent / "logs"
 TRADES_LOG   = LOG_DIR / "gold_trades.csv"
 SUMMARY_LOG  = LOG_DIR / "gold_summary.txt"
@@ -47,6 +57,8 @@ class PaperTraderGold:
         self.current_trade: Optional[GoldTrade] = None
         self.trade_history: list[GoldTrade]     = []
         self._gbpusd = DEFAULT_GBPUSD
+        self.ig = None              # Stage B: Capital.com connector, attached by the engine at startup
+        self._bal_at_open = None    # real account balance captured when the live order was placed
 
         previous_capital = self._load_last_capital()
         if previous_capital:
@@ -92,6 +104,8 @@ class PaperTraderGold:
             "stop_loss":        t.stop_loss,
             "take_profit":      t.take_profit,
             "stake":            t.stake,
+            "deal_id":          getattr(t, "deal_id", None),   # Stage B: live position id
+            "bal_at_open":      self._bal_at_open,             # Stage B: balance when opened (for real P&L)
         }
         try:
             STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
@@ -128,6 +142,8 @@ class PaperTraderGold:
             trade.stop_loss   = data["stop_loss"]
             trade.take_profit = data["take_profit"]
             trade.stake       = data["stake"]
+            trade.deal_id     = data.get("deal_id")            # Stage B: live position id
+            self._bal_at_open = data.get("bal_at_open")
             self.current_trade = trade
             log.info(
                 "STATE RESTORED: %s entry=$%.2f stop=$%.2f size=%.2foz",
@@ -222,19 +238,67 @@ class PaperTraderGold:
     def total_pnl(self) -> float:
         return sum(t.pnl_gbp for t in self.trade_history if t.pnl_gbp is not None)
 
+    def _real_balance(self):
+        """Fresh Capital.com balance (no cache). Returns float or None on failure."""
+        try:
+            return self.ig.get_account_balance() if self.ig is not None else None
+        except Exception as exc:
+            log.warning("balance read failed: %s", exc)
+            return None
+
+    def reconcile_live_position(self):
+        """Stage B restart safety -- engine calls this once after attaching the connector. If we
+        restored an OPEN trade but Capital.com has no matching position (broker stop/TP fired while we
+        were down, or it never really opened), discard the stale state so we never manage a phantom."""
+        if not (LIVE_EXECUTION and self.ig is not None and self.in_trade):
+            return
+        deal_id = getattr(self.current_trade, "deal_id", None)
+        pos = existing_position(self.ig, LIVE_EPIC)
+        if pos is None:
+            log.warning("RECONCILE: restored an open trade but Capital.com has NO %s position "
+                        "(deal_id=%s) -- discarding stale state, returning to FLAT.", LIVE_EPIC, deal_id)
+            self.current_trade = None
+            self._bal_at_open = None
+            self._clear_state()
+        elif pos == "UNKNOWN":
+            log.warning("RECONCILE: could not verify %s position on startup -- retry next cycle.", LIVE_EPIC)
+        else:
+            log.info("RECONCILE: live %s position confirmed open (deal_id=%s).", LIVE_EPIC, deal_id)
+
     def open_trade(self, direction: str, price: float, gbpusd: float,
-                   liquidity_period: str = "") -> GoldTrade:
-        """Open a new paper trade and log it."""
+                   liquidity_period: str = "") -> Optional[GoldTrade]:
+        """Open a trade. When LIVE_EXECUTION is on, place a REAL Capital.com demo order and only report
+        the trade as open once Capital.com confirms it (fail CLOSED -> returns None, engine stays flat)."""
         from strategy_gold import open_trade
         self._gbpusd = gbpusd
         # Pass current balance for K1 compounding (USE_COMPOUNDING); ignored when fixed (paper).
         self.current_trade = open_trade(direction, price, gbpusd, liquidity_period,
                                         balance=self.capital_gbp)
+        # ── STAGE B: when live execution is on, a trade ONLY opens on a confirmed REAL demo order.
+        # If the connector is missing/unreachable we STAY FLAT (never silently fall back to paper). ──
+        if LIVE_EXECUTION:
+            if self.ig is None or not getattr(self.ig, "connected", False):
+                log.error("[OPEN ABORTED] LIVE_EXECUTION on but Capital.com connector unavailable -- staying FLAT.")
+                self.current_trade = None
+                self._bal_at_open = None
+                self._clear_state()
+                return None
+            self._bal_at_open = self._real_balance()
+            deal_id = place_order(self.ig, LIVE_EPIC, direction,
+                                  self.current_trade.size_oz, self.current_trade.stop_pts)
+            if not deal_id:
+                log.error("[OPEN ABORTED] real demo order was not placed -- staying FLAT.")
+                self.current_trade = None
+                self._bal_at_open = None
+                self._clear_state()
+                return None
+            self.current_trade.deal_id = deal_id
         self._save_state()
         log.info(
-            "[OPEN] %s | entry=$%.2f | size=%.2foz | stake=£%.4f/pt | stop=$%.2f | target=$%.2f",
+            "[OPEN] %s | entry=$%.2f | size=%.2foz | stake=£%.4f/pt | stop=$%.2f | target=$%.2f | %s",
             direction, price, self.current_trade.size_oz, self.current_trade.stake,
             self.current_trade.stop_loss, self.current_trade.take_profit,
+            ("LIVE id=%s" % getattr(self.current_trade, "deal_id", "?")) if (LIVE_EXECUTION and self.ig) else "PAPER",
         )
         return self.current_trade
 
@@ -254,17 +318,33 @@ class PaperTraderGold:
                 price = max(self.current_trade.stop_loss, price)
             else:
                 price = min(self.current_trade.stop_loss, price)
+        # ── STAGE B: close the REAL demo order and read the realised P&L (account-balance delta) ──
+        real_pnl, bal_after = None, None
+        deal_id = getattr(self.current_trade, "deal_id", None)
+        if LIVE_EXECUTION and self.ig is not None and deal_id:
+            close_order(self.ig, LIVE_EPIC, deal_id, self.current_trade.direction, self.current_trade.size_oz)
+            bal_after = self._real_balance()
+            if bal_after is not None and self._bal_at_open is not None:
+                real_pnl = round(bal_after - self._bal_at_open, 2)
         from strategy_gold import close_trade
         trade = close_trade(self.current_trade, price, reason, rate)
-        self.capital_gbp = round(self.capital_gbp + trade.pnl_gbp, 2)
+        # The REAL realised P&L (from Capital.com) is authoritative for the record; fall back to the
+        # price-based figure only if the balance read failed. Format/columns are unchanged either way.
+        if real_pnl is not None:
+            trade.pnl_gbp    = real_pnl
+            self.capital_gbp = round(bal_after, 2)
+        else:
+            self.capital_gbp = round(self.capital_gbp + trade.pnl_gbp, 2)
+        self._bal_at_open = None
         self.trade_history.append(trade)
         self._log_trade(trade)
         self._save_summary()
         self._clear_state()
         result = "PROFIT" if trade.pnl_gbp >= 0 else "LOSS"
         log.info(
-            "[%s] Trade complete | %s | pts=%+.1f | P&L=GBP %+.2f | capital=GBP %.2f",
+            "[%s] Trade complete | %s | pts=%+.1f | P&L=GBP %+.2f | capital=GBP %.2f | %s",
             result, trade.direction, trade.points_gained, trade.pnl_gbp, self.capital_gbp,
+            ("REAL (Capital.com)" if real_pnl is not None else "price-based"),
         )
         self.current_trade = None
         return trade
