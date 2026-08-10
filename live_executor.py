@@ -33,8 +33,11 @@ def demo_ok(ig) -> bool:
 def existing_position(ig, epic):
     """Return Capital.com's open position dict for `epic`, or None.
     Used for the double-entry guard and for restart/stop reconciliation.
-    On an API error returns the sentinel string "UNKNOWN" so the caller can tell
-    'confirmed none' (None) apart from 'could not check' (UNKNOWN) and stay safe."""
+    On an API error OR a disconnected connector returns the sentinel "UNKNOWN" so the caller can
+    tell 'confirmed none' (None) apart from 'could not check' (UNKNOWN) and stay safe (never
+    false-discard a real position, never place a blind second order)."""
+    if ig is None or not getattr(ig, "connected", False):
+        return "UNKNOWN"
     try:
         for p in (ig.get_open_positions() or []):
             if (p.get("market", {}) or {}).get("epic") == epic:
@@ -57,11 +60,30 @@ def position_pnl(ig, epic):
         return None
 
 
+def market_tradeable(ig, epic):
+    """True if Capital.com currently lists `epic` as TRADEABLE. Fail-OPEN on a check error
+    (return True) -- the order POST + its rejection is the real backstop; this pre-check only lets us
+    SKIP cleanly (no noisy rejected order) when we can confirm the market is in its closed window."""
+    try:
+        import requests
+        r = requests.get("%s/markets/%s" % (ig._base_url, epic), headers=ig._headers(), timeout=8)
+        if r.status_code == 200:
+            return (r.json().get("snapshot", {}) or {}).get("marketStatus") == "TRADEABLE"
+    except Exception as exc:
+        log.warning("market_tradeable(%s) check failed: %s", epic, exc)
+    return True
+
+
 def place_order(ig, epic, direction, size, stop_pts):
     """Place a DEMO order. `direction` is 'LONG'/'SHORT'. Returns deal_id or None.
     Fails CLOSED: on any refusal/error returns None and the engine stays flat."""
     if not demo_ok(ig):
         log.error("ORDER REFUSED: connector is not a connected DEMO account -- staying FLAT.")
+        return None
+    # Skip cleanly if the market is in a closed window (e.g. Brent's 22:00-00:00 UTC daily break) --
+    # avoids a guaranteed-reject order. The engine stays flat and will enter when the market reopens.
+    if not market_tradeable(ig, epic):
+        log.info("ORDER SKIPPED: %s market is CLOSED (Capital.com) -- staying flat until it reopens.", epic)
         return None
     guard = existing_position(ig, epic)
     if guard is not None:          # a position exists, OR we couldn't verify -> refuse

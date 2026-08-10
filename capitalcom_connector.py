@@ -310,7 +310,12 @@ class CapitalComConnector:
             deal_id = confirm.get("dealId", "") if confirm else ""
             return {"deal_reference": deal_ref, "deal_id": deal_id}
         except Exception as exc:
-            log.error("open_position failed: %s", exc)
+            _body = ""
+            try:
+                _body = exc.response.text if getattr(exc, "response", None) is not None else ""
+            except Exception:
+                _body = ""
+            log.error("open_position failed: %s %s", exc, _body)
             return None
 
     def close_position(

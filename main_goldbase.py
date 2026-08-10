@@ -415,7 +415,7 @@ def main() -> None:
     stanley = PaperTraderGold()
     # ── STAGE B: attach the connector so Stanley can place/close REAL demo orders, then reconcile any
     # restored open position against Capital.com (so a restart never leaves us managing a phantom). ──
-    stanley.ig = ig if ig_connected else None
+    stanley.ig = ig    # pass the connector object always; it self-heals a failed startup connect
     stanley.reconcile_live_position()
     if _LIVE_EXECUTION:
         log.warning("*** STAGE B LIVE EXECUTION ON -- REAL demo orders will be placed on the "
