@@ -329,23 +329,15 @@ class PaperTraderGold:
                 price = max(self.current_trade.stop_loss, price)
             else:
                 price = min(self.current_trade.stop_loss, price)
-        # ── STAGE B: close the REAL demo order and read the realised P&L (account-balance delta) ──
-        real_pnl, bal_after = None, None
+        # ── STAGE B: close the REAL demo order. P&L is PRICE-BASED (points x stake, net of spread) --
+        # deposit-IMMUNE and scale-consistent, so an account top-up/withdrawal can never corrupt a
+        # trade's P&L. The real account balance is shown separately as TOTAL POT (from Capital.com). ──
         deal_id = getattr(self.current_trade, "deal_id", None)
         if LIVE_EXECUTION and self.ig is not None and deal_id:
             close_order(self.ig, LIVE_EPIC, deal_id, self.current_trade.direction, self.current_trade.size_oz)
-            bal_after = self._real_balance()
-            if bal_after is not None and self._bal_at_open is not None:
-                real_pnl = round(bal_after - self._bal_at_open, 2)
         from strategy_gold import close_trade
         trade = close_trade(self.current_trade, price, reason, rate)
-        # The REAL realised P&L (from Capital.com) is authoritative for the record; fall back to the
-        # price-based figure only if the balance read failed. Format/columns are unchanged either way.
-        if real_pnl is not None:
-            trade.pnl_gbp    = real_pnl
-            self.capital_gbp = round(bal_after, 2)
-        else:
-            self.capital_gbp = round(self.capital_gbp + trade.pnl_gbp, 2)
+        self.capital_gbp = round(self.capital_gbp + trade.pnl_gbp, 2)
         self._bal_at_open = None
         self.trade_history.append(trade)
         self._log_trade(trade)
@@ -353,9 +345,8 @@ class PaperTraderGold:
         self._clear_state()
         result = "PROFIT" if trade.pnl_gbp >= 0 else "LOSS"
         log.info(
-            "[%s] Trade complete | %s | pts=%+.1f | P&L=GBP %+.2f | capital=GBP %.2f | %s",
+            "[%s] Trade complete | %s | pts=%+.1f | P&L=GBP %+.2f | capital=GBP %.2f",
             result, trade.direction, trade.points_gained, trade.pnl_gbp, self.capital_gbp,
-            ("REAL (Capital.com)" if real_pnl is not None else "price-based"),
         )
         self.current_trade = None
         return trade

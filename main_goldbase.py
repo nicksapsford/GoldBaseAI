@@ -236,6 +236,48 @@ def _maybe_notify_two_speed(trade) -> None:
         trade._two_speed_notified = True
 
 
+# ── Periodic position reconciliation (Part 2, 11 Aug 2026) ──────────────────────────────────────
+# While in a LIVE trade, verify (throttled ~60s) that the position still exists on Capital.com. If it
+# was closed EXTERNALLY (margin liquidation, manual close on the app, network) before our own stop
+# fired, book it as EXTERNAL_CLOSE (real P&L from the balance delta), return FLAT, and alert Nick.
+# FAIL-SAFE: NEVER flatten on an uncertain API response -- only on a CONFIRMED "not found".
+_recon = {"fails": 0, "last_ts": 0.0}
+
+
+def _reconcile_external_close(stanley, account, ig, price, gbpusd) -> bool:
+    if not (_LIVE_EXECUTION and ig is not None and stanley.in_trade):
+        return False
+    if not getattr(stanley.current_trade, "deal_id", None):
+        return False
+    now = time.time()
+    if now - _recon["last_ts"] < 60:          # throttle (brief cadence: <= every poll cycle / 5 min)
+        return False
+    _recon["last_ts"] = now
+    pos = live_executor.existing_position(ig, GOLD_EPIC)
+    if pos == "UNKNOWN":                       # API failure -> NEVER flatten on uncertain
+        _recon["fails"] += 1
+        log.warning("reconcile: could not verify GOLD position (%d consecutive failures)", _recon["fails"])
+        if _recon["fails"] == 3:
+            try:
+                notify_system_error("GoldBase: 3 consecutive position-reconcile failures -- check Capital.com/network.")
+            except Exception:
+                pass
+        return False
+    _recon["fails"] = 0
+    if pos is None:                            # CONFIRMED closed externally
+        deal_id = getattr(stanley.current_trade, "deal_id", None)
+        log.warning("EXTERNAL CLOSE detected: GOLD position gone on Capital.com (deal %s) -- booking + FLAT.", deal_id)
+        trade = stanley.close_trade(price, "EXTERNAL_CLOSE", gbpusd)
+        if trade is not None:
+            account.record_trade(trade.pnl_gbp)
+        try:
+            notify_system_error("Position closed externally on Gold -- check Capital.com.")
+        except Exception:
+            pass
+        return True
+    return False
+
+
 def monitor(feed, stanley, account, ig, now_utc):
     if not stanley.in_trade:
         return
@@ -243,6 +285,8 @@ def monitor(feed, stanley, account, ig, now_utc):
     if price is None:
         return
     gbpusd = get_gbpusd_rate(ig)
+    if _reconcile_external_close(stanley, account, ig, price, gbpusd):
+        return   # position closed externally -- booked as EXTERNAL_CLOSE, now FLAT
     if should_force_close(now_utc):
         stanley.close_trade(price, "FORCE_CLOSE_2045", gbpusd)
         _on_close(stanley, account, price, "FORCE_CLOSE_2045")
