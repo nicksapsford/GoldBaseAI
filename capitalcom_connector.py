@@ -307,7 +307,17 @@ class CapitalComConnector:
                 direction, epic, size, stop_distance, deal_ref,
             )
             confirm = self._confirm_deal(deal_ref)
-            deal_id = confirm.get("dealId", "") if confirm else ""
+            # Capital.com returns a dealId even for a REJECTED order -- MUST check dealStatus, else the
+            # caller treats a rejected order as an open position (phantom). ACCEPTED = real fill.
+            if not confirm or confirm.get("dealStatus") != "ACCEPTED":
+                log.error("open_position REJECTED | epic=%s | dealStatus=%s | reason=%s | status=%s",
+                          epic, (confirm or {}).get("dealStatus"), (confirm or {}).get("reason"),
+                          (confirm or {}).get("status"))
+                return None
+            deal_id = confirm.get("dealId", "")
+            if not deal_id:
+                log.error("open_position: ACCEPTED but no dealId (%s) -- treating as failed.", epic)
+                return None
             return {"deal_reference": deal_ref, "deal_id": deal_id}
         except Exception as exc:
             _body = ""
