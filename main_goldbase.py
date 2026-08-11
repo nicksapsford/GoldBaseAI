@@ -487,6 +487,7 @@ def main() -> None:
     last_candle = 0.0
     last_monitor = 0.0
     last_push = 0.0
+    last_order_recon = 0.0
 
     while not _SHUTDOWN:
         try:
@@ -517,6 +518,20 @@ def main() -> None:
             if (now - last_push) >= 15:
                 push_dashboard(stanley, account, direction_switch.get_mode(), ig)
                 last_push = now
+
+            # AUTOMATED order-audit reconcile vs Capital.com /history/activity (hourly, go-live safety)
+            if _LIVE_EXECUTION and ig is not None and (now - last_order_recon) >= 3600:
+                last_order_recon = now
+                try:
+                    _mm = live_executor.reconcile_orders(ig, GOLD_EPIC, hours=24)
+                    if _mm:
+                        for _m in _mm:
+                            log.error("ORDER RECONCILE MISMATCH: %s", _m)
+                        notify_system_error("GoldBase order reconcile: %d mismatch(es) vs Capital.com -- check logs/order_audit.csv." % len(_mm))
+                    else:
+                        log.info("Order reconcile OK -- audit log matches Capital.com.")
+                except Exception as _e:
+                    log.warning("order reconcile failed: %s", _e)
 
             time.sleep(2)
         except Exception as exc:
