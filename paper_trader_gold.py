@@ -16,6 +16,7 @@ import pandas as pd
 
 from strategy_gold import GoldTrade, TRAILING_STOP_POINTS, DEFAULT_GBPUSD
 from live_executor import place_order, close_order, existing_position, sync_stop
+import trading_mode
 
 log = logging.getLogger("GoldTrader.Stanley")
 
@@ -271,9 +272,15 @@ class PaperTraderGold:
         the trade as open once Capital.com confirms it (fail CLOSED -> returns None, engine stays flat)."""
         from strategy_gold import open_trade
         self._gbpusd = gbpusd
-        # Pass current balance for K1 compounding (USE_COMPOUNDING); ignored when fixed (paper).
-        self.current_trade = open_trade(direction, price, gbpusd, liquidity_period,
-                                        balance=self.capital_gbp)
+        # STAGE C compounding: size 2% off the REAL account balance (demo £31k / live £3k), not the
+        # price-based paper capital. Ignored when USE_COMPOUNDING=False. Falls back to capital_gbp if the
+        # balance read is unavailable (a smaller, safe size).
+        _basis = self.capital_gbp
+        if LIVE_EXECUTION and self.ig is not None:
+            _rb = self._real_balance()
+            if _rb and _rb > 0:
+                _basis = _rb
+        self.current_trade = open_trade(direction, price, gbpusd, liquidity_period, balance=_basis)
         # ── STAGE B: when live execution is on, a trade ONLY opens on a confirmed REAL demo order.
         # If the connector is missing/unreachable we STAY FLAT (never silently fall back to paper). ──
         if LIVE_EXECUTION:
@@ -296,7 +303,8 @@ class PaperTraderGold:
                 return None
             self._bal_at_open = self._real_balance()
             deal_id = place_order(self.ig, LIVE_EPIC, direction,
-                                  self.current_trade.size_oz, self.current_trade.stop_pts)
+                                  self.current_trade.size_oz, self.current_trade.stop_pts,
+                                  allow_live=(trading_mode.read_mode() == "LIVE"))
             if not deal_id:
                 log.error("[OPEN ABORTED] real demo order was not placed -- staying FLAT.")
                 self.current_trade = None

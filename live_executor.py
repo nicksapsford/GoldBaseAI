@@ -62,6 +62,23 @@ def demo_ok(ig) -> bool:
         return False
 
 
+def trading_permitted(ig, allow_live=False) -> bool:
+    """The Stage C order gate. A DEMO account may ALWAYS trade (demo is never real money). A LIVE account
+    may trade ONLY when `allow_live` is True -- the caller has confirmed mode==LIVE AND ALLOW_LIVE_TRADING
+    (Layers 1+2 of the safety chain). Requires a connected account. Fail CLOSED on any doubt."""
+    try:
+        if ig is None or not ig.connected:
+            return False
+        acc = ig.account_type
+        if acc == "DEMO":
+            return True
+        if acc == "LIVE":
+            return bool(allow_live)
+        return False
+    except Exception:
+        return False
+
+
 def existing_position(ig, epic):
     """Return Capital.com's open position dict for `epic`, or None.
     Used for the double-entry guard and for restart/stop reconciliation.
@@ -106,12 +123,14 @@ def market_tradeable(ig, epic):
     return True
 
 
-def place_order(ig, epic, direction, size, stop_pts):
-    """Place a DEMO order. `direction` is 'LONG'/'SHORT'. Returns deal_id or None.
+def place_order(ig, epic, direction, size, stop_pts, allow_live=False):
+    """Place an order on the connected account. `direction` is 'LONG'/'SHORT'. Returns deal_id or None.
+    A DEMO account always trades; a LIVE account requires allow_live (mode==LIVE AND ALLOW_LIVE_TRADING).
     Fails CLOSED: on any refusal/error returns None and the engine stays flat."""
-    if not demo_ok(ig):
-        log.error("ORDER REFUSED: connector is not a connected DEMO account -- staying FLAT.")
-        _audit(epic, "OPEN", direction, size, stop_pts, outcome="REFUSED", reason="not a connected DEMO account")
+    if not trading_permitted(ig, allow_live):
+        log.error("ORDER REFUSED: trading not permitted -- not a connected DEMO account, or LIVE without "
+                  "the safety chain (mode/ALLOW_LIVE_TRADING) -- staying FLAT.")
+        _audit(epic, "OPEN", direction, size, stop_pts, outcome="REFUSED", reason="trading not permitted (account / live-lock)")
         return None
     # Skip cleanly if the market is in a closed window (e.g. Brent's 22:00-00:00 UTC daily break) --
     # avoids a guaranteed-reject order. The engine stays flat and will enter when the market reopens.

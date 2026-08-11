@@ -382,6 +382,26 @@ def get_account_pot(ig):
     return _bal_cache["balance"], acc_type
 
 
+# ── Market status for the dashboard dot (Part 4d) ─────────────────────────────
+# in_session = the trading schedule (is_market_open, no API). tradeable = Capital.com marketStatus,
+# cached 60s so the dot never hammers /markets. Dot: green = in session + tradeable; amber = in session
+# but Capital temporarily closed (e.g. daily break); red = out of session. Hours are display-only.
+SESSION_HOURS = "22:00–20:45 UTC"
+_mkt_cache = {"ts": 0.0, "tradeable": None}
+
+
+def get_market_status(ig, now_utc):
+    in_sess = is_market_open(now_utc)
+    now = time.time()
+    if _mkt_cache["tradeable"] is None or (now - _mkt_cache["ts"]) >= 60:
+        try:
+            if ig is not None and ig.connected:
+                _mkt_cache.update(ts=now, tradeable=bool(live_executor.market_tradeable(ig, GOLD_EPIC)))
+        except Exception:
+            pass
+    return {"in_session": in_sess, "tradeable": _mkt_cache["tradeable"], "hours": SESSION_HOURS}
+
+
 def push_dashboard(stanley, account, mode, ig=None):
     trade = stanley.current_trade
     price = _last.get("price")
@@ -415,6 +435,7 @@ def push_dashboard(stanley, account, mode, ig=None):
         "account_balance": pot, "account_type": acc_type,
         "risk_per_trade": risk, "total_pot": pot,
         "mode": mode, "session": _last.get("session", "--"),
+        "market": get_market_status(ig, datetime.now(timezone.utc)),
         "updated_utc": datetime.now(timezone.utc).strftime("%H:%M:%S"),
         "price": round(price, 2) if price is not None else None,
         "in_trade": stanley.in_trade, "position": pos,

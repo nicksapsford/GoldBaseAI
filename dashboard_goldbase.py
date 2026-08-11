@@ -15,6 +15,7 @@ from pathlib import Path
 from flask import Flask, jsonify, request
 
 import direction_switch
+import trading_mode
 
 BASE_DIR = Path(__file__).resolve().parent
 LOG_DIR = BASE_DIR / "logs"
@@ -82,21 +83,16 @@ table.tr td{padding:6px 8px;border-bottom:1px solid rgba(255,255,255,0.04);}
     <small>__VER__ &middot; port 5033 &middot; Gold XAU/USD &middot; Lancelot + 3-TF SSL + switch</small></div>
   <div class="nav">
     __ENV__
+    <span id="modeLabel">PAPER &mdash; DEMO</span>
     <button class="navbtn" id="toPnl" onclick="showPage(2)">P&amp;L &rarr;</button>
     <div class="clock" id="clock">--:--:-- UTC</div>
   </div>
 </header>
 <div class="wrap">
   <div id="page1">
-  <div class="switch-bar">
-    <span class="lbl">Direction Switch</span>
-    <button class="sw-btn" id="swWITH" onclick="setDir('WITH')">WITH</button>
-    <button class="sw-btn" id="swAGAINST" onclick="setDir('AGAINST')">AGAINST</button>
-    <span class="sw-meta" id="swMeta">--</span>
-  </div>
   <div class="card"><div id="body">Awaiting engine...</div></div>
-  <div class="note">Benchmark Desk &mdash; pure Lancelot + 3-timeframe SSL agreement, traded WITH or AGAINST.
-    No Arthur, Morgan, Guinevere or phantom logging. Paper trading only.</div>
+  <div class="note">AlbionBase &mdash; pure Lancelot + 3-timeframe SSL agreement, trading WITH the signal.
+    No Arthur, Morgan, Guinevere or phantom logging. PAPER/LIVE controlled from the RoundTableBase master switch.</div>
   </div><!-- /page1 -->
   <div id="page2" style="display:none;">
     <div style="margin-bottom:14px;"><button class="navbtn" onclick="showPage(1)">&larr; Back to Dashboard</button></div>
@@ -112,15 +108,13 @@ function clk(){var t=new Date();document.getElementById('clock').textContent=
 setInterval(clk,1000);clk();
 function row(k,v,cls){return '<div class="row"><span class="k">'+k+'</span><span class="'+(cls||'')+'">'+v+'</span></div>';}
 function money(v){if(v===null||v===undefined)return '--';var n=Number(v);return (n<0?'-£':'+£')+Math.abs(n).toFixed(2);}
-function renderDir(m){
-  var mode=(m&&m.mode)||'WITH';
-  document.getElementById('swWITH').className='sw-btn'+(mode==='WITH'?' on-WITH':'');
-  document.getElementById('swAGAINST').className='sw-btn'+(mode==='AGAINST'?' on-AGAINST':'');
-  document.getElementById('swMeta').textContent='Active: '+mode+(m&&m.set_at?' (set '+m.set_at+')':'');
-}
-function setDir(mode){
-  fetch('/api/direction',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:mode,by:'Nick'})})
-    .then(function(r){return r.json();}).then(renderDir).catch(function(e){console.error(e);});
+function renderMode(m){
+  var live=(m==='LIVE');
+  var lbl=document.getElementById('modeLabel');
+  if(!lbl)return;
+  lbl.innerHTML=live?'LIVE &mdash; REAL MONEY':'PAPER &mdash; DEMO';
+  lbl.style.cssText='padding:3px 10px;border-radius:5px;font-weight:700;font-size:11px;letter-spacing:0.5px;'+
+    (live?'background:#12331b;color:#3fb950;border:1px solid #2ea043;':'background:#3a2f00;color:#e0b020;border:1px solid #6b5600;');
 }
 function poll(){
   fetch('/api/state').then(function(r){return r.json();}).then(function(d){
@@ -146,9 +140,8 @@ function poll(){
     h+=row('Session',d.session||'--','mut');
     h+=row('Updated',(d.updated_utc||'--')+' UTC','mut');
     document.getElementById('body').innerHTML=h;
-    if(d.mode){renderDir({mode:d.mode});}
+    renderMode(d.trading_mode);
   }).catch(function(e){});
-  fetch('/api/direction').then(function(r){return r.json();}).then(renderDir).catch(function(e){});
 }
 poll();setInterval(poll,5000);
 function showPage(n){
@@ -221,7 +214,16 @@ def api_update():
 
 @app.route("/api/state")
 def api_state():
-    return jsonify(_state)
+    d = dict(_state)
+    try:
+        d["trading_mode"] = trading_mode.read_mode()
+        d["allow_live"] = trading_mode.ALLOW_LIVE_TRADING
+        d["cum_pnl"] = trading_mode.cum_pnl_since_epoch(TRADES_CSV)   # Part 4c: real orders only
+        d["pnl_start"] = trading_mode.PNL_START_DATE
+    except Exception:
+        d["trading_mode"] = "PAPER"
+        d["allow_live"] = False
+    return jsonify(d)
 
 
 @app.route("/api/direction", methods=["GET", "POST"])
