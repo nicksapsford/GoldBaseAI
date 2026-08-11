@@ -41,6 +41,7 @@ from notifier_gold import (
 )
 from paper_trader_gold import PaperTraderGold, TRADES_LOG, LIVE_EXECUTION as _LIVE_EXECUTION
 import live_executor
+import trading_mode
 from pre_checks_gold import run_all_pre_checks, run_individual_pre_checks, check_kill_switch_reset
 from strategy_gold import should_force_close, get_gbpusd_rate, TIGHT_TRAIL_ACTIVATE_POINTS
 import direction_switch
@@ -455,14 +456,35 @@ def push_dashboard(stanley, account, mode, ig=None):
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
+def _sync_account(ig, stanley):
+    """Follow the DEMO/LIVE switch. If trading_mode changed and we are FLAT, re-point the connector at the
+    selected Capital.com account (reconnects). NEVER switches accounts while a position is open -- that
+    position is managed on the account it was opened on until it closes (the RoundTableBase switch is
+    itself blocked while a position is open). Fail-safe: any error leaves the current account untouched."""
+    try:
+        import trading_mode
+        desired = trading_mode.read_mode()
+        if ig is None or desired == ig.account_type:
+            return
+        if getattr(stanley, "in_trade", False):
+            return
+        if ig.set_account(desired):
+            log.warning("ACCOUNT SWITCHED to %s (trading_mode=%s)", ig.account_type, desired)
+        else:
+            log.warning("ACCOUNT SWITCH to %s refused (credentials not configured?) -- staying on %s",
+                        desired, ig.account_type)
+    except Exception as exc:
+        log.warning("account sync error: %s", exc)
+
+
 def main() -> None:
     log.info("=" * 70)
     log.info("  GoldBase A.I. v%s  (Benchmark Desk, port %d)", VERSION, PORT)
     log.info("  Gold XAU/USD | Capital.com | Pure Lancelot + 3-TF SSL + WITH/AGAINST")
-    log.info("  Mode: %s | PAPER TRADING", direction_switch.get_mode())
+    log.info("  Direction: %s | account: %s (DEMO/LIVE switch)", direction_switch.get_mode(), trading_mode.read_mode())
     log.info("=" * 70)
 
-    ig = CapitalComConnector()
+    ig = CapitalComConnector(trading_mode.read_mode())   # DEMO/LIVE from the switch (startup DEMO)
     ig_connected = False
     try:
         ig.connect()
@@ -494,7 +516,7 @@ def main() -> None:
     if account.daily_pnl_gbp:
         log.info("Restored today's realised P&L from trade log: GBP %.2f", account.daily_pnl_gbp)
     try:
-        notify_system_startup(capital=stanley.capital_gbp, mode="PAPER (Benchmark)")
+        notify_system_startup(capital=stanley.capital_gbp, mode=trading_mode.read_mode())
     except Exception:
         pass
     SHUTDOWN_FLAG.unlink(missing_ok=True)
@@ -518,6 +540,7 @@ def main() -> None:
             now = time.monotonic()
             now_utc = datetime.now(timezone.utc)
             account.maybe_reset_daily(now_utc)  # Benchmark daily-reset fix
+            _sync_account(ig, stanley)  # follow the DEMO/LIVE switch (flat-only)
 
             if check_kill_switch_reset(account):
                 account.kill_switch_tier = 0

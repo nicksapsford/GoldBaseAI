@@ -83,7 +83,7 @@ table.tr td{padding:6px 8px;border-bottom:1px solid rgba(255,255,255,0.04);}
     <small>__VER__ &middot; port 5033 &middot; Gold XAU/USD &middot; Lancelot + 3-TF SSL + switch</small></div>
   <div class="nav">
     __ENV__
-    <span id="modeLabel">PAPER &mdash; DEMO</span>
+    <span id="modeLabel">DEMO</span>
     <button class="navbtn" id="toPnl" onclick="showPage(2)">P&amp;L &rarr;</button>
     <div class="clock" id="clock">--:--:-- UTC</div>
   </div>
@@ -92,7 +92,7 @@ table.tr td{padding:6px 8px;border-bottom:1px solid rgba(255,255,255,0.04);}
   <div id="page1">
   <div class="card"><div id="body">Awaiting engine...</div></div>
   <div class="note">AlbionBase &mdash; pure Lancelot + 3-timeframe SSL agreement, trading WITH the signal.
-    No Arthur, Morgan, Guinevere or phantom logging. PAPER/LIVE controlled from the RoundTableBase master switch.</div>
+    No Arthur, Morgan, Guinevere or phantom logging. DEMO/LIVE account controlled from the RoundTableBase master switch.</div>
   </div><!-- /page1 -->
   <div id="page2" style="display:none;">
     <div style="margin-bottom:14px;"><button class="navbtn" onclick="showPage(1)">&larr; Back to Dashboard</button></div>
@@ -112,9 +112,9 @@ function renderMode(m){
   var live=(m==='LIVE');
   var lbl=document.getElementById('modeLabel');
   if(!lbl)return;
-  lbl.innerHTML=live?'LIVE &mdash; REAL MONEY':'PAPER &mdash; DEMO';
+  lbl.innerHTML=live?'LIVE &mdash; REAL MONEY':'DEMO';
   lbl.style.cssText='padding:3px 10px;border-radius:5px;font-weight:700;font-size:11px;letter-spacing:0.5px;'+
-    (live?'background:#12331b;color:#3fb950;border:1px solid #2ea043;':'background:#3a2f00;color:#e0b020;border:1px solid #6b5600;');
+    (live?'background:#3d0f0f;color:#ff5555;border:1px solid #b02020;':'background:#3a2f00;color:#e0b020;border:1px solid #6b5600;');
 }
 function poll(){
   fetch('/api/state').then(function(r){return r.json();}).then(function(d){
@@ -217,12 +217,12 @@ def api_state():
     d = dict(_state)
     try:
         d["trading_mode"] = trading_mode.read_mode()
-        d["allow_live"] = trading_mode.ALLOW_LIVE_TRADING
+        d["live_configured"] = trading_mode.has_live_credentials()   # LIVE switch gated on this
         d["cum_pnl"] = trading_mode.cum_pnl_since_epoch(TRADES_CSV)   # Part 4c: real orders only
         d["pnl_start"] = trading_mode.PNL_START_DATE
     except Exception:
-        d["trading_mode"] = "PAPER"
-        d["allow_live"] = False
+        d["trading_mode"] = "DEMO"
+        d["live_configured"] = False
     return jsonify(d)
 
 

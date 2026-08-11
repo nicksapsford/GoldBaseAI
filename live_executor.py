@@ -30,11 +30,12 @@ log = logging.getLogger("LiveExecutor")
 # logs/order_audit.csv. Reconcilable against Capital.com's /history/activity. Never raises -- an audit
 # write must never break trading.
 _AUDIT_FILE = Path(__file__).resolve().parent / "logs" / "order_audit.csv"
-_AUDIT_HEADERS = ["ts_utc", "epic", "action", "direction", "size", "stop", "outcome", "deal_id", "reason"]
+_AUDIT_HEADERS = ["ts_utc", "epic", "action", "direction", "size", "stop", "outcome", "deal_id", "mode", "reason"]
 
 
-def _audit(epic, action, direction=None, size=None, stop=None, outcome="", deal_id="", reason=""):
-    """Append one order-interaction row. action = OPEN / CLOSE / STOP_SYNC.
+def _audit(epic, action, direction=None, size=None, stop=None, outcome="", deal_id="", reason="", mode=""):
+    """Append one order-interaction row. action = OPEN / CLOSE / STOP_SYNC. `mode` = DEMO / LIVE so every
+    order is permanently attributable to the correct Capital.com account (Part 5).
     outcome = ACCEPTED / REJECTED / SKIPPED_MARKET_CLOSED / REFUSED / FAILED / ALREADY_CLOSED."""
     try:
         _AUDIT_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -48,7 +49,8 @@ def _audit(epic, action, direction=None, size=None, stop=None, outcome="", deal_
                 "epic": epic, "action": action, "direction": direction or "",
                 "size": ("%.2f" % size) if isinstance(size, (int, float)) else "",
                 "stop": ("%.2f" % stop) if isinstance(stop, (int, float)) else "",
-                "outcome": outcome, "deal_id": deal_id or "", "reason": (reason or "")[:160],
+                "outcome": outcome, "deal_id": deal_id or "", "mode": mode or "",
+                "reason": (reason or "")[:160],
             })
     except Exception as exc:
         log.warning("audit log write failed: %s", exc)
@@ -62,19 +64,14 @@ def demo_ok(ig) -> bool:
         return False
 
 
-def trading_permitted(ig, allow_live=False) -> bool:
-    """The Stage C order gate. A DEMO account may ALWAYS trade (demo is never real money). A LIVE account
-    may trade ONLY when `allow_live` is True -- the caller has confirmed mode==LIVE AND ALLOW_LIVE_TRADING
-    (Layers 1+2 of the safety chain). Requires a connected account. Fail CLOSED on any doubt."""
+def trading_permitted(ig) -> bool:
+    """Trade whenever the connector is CONNECTED. The DEMO/LIVE choice is made upstream by the trading_mode
+    switch: the engine points the connector at the demo OR the live account, and a LIVE switch is only ever
+    reachable once Nick has flipped it (behind a confirmation) with live credentials present. If LIVE is
+    selected but not configured, the connector never connects -> this returns False -> we stay flat.
+    Fail CLOSED on any doubt."""
     try:
-        if ig is None or not ig.connected:
-            return False
-        acc = ig.account_type
-        if acc == "DEMO":
-            return True
-        if acc == "LIVE":
-            return bool(allow_live)
-        return False
+        return ig is not None and ig.connected and ig.account_type in ("DEMO", "LIVE")
     except Exception:
         return False
 
@@ -123,45 +120,45 @@ def market_tradeable(ig, epic):
     return True
 
 
-def place_order(ig, epic, direction, size, stop_pts, allow_live=False):
-    """Place an order on the connected account. `direction` is 'LONG'/'SHORT'. Returns deal_id or None.
-    A DEMO account always trades; a LIVE account requires allow_live (mode==LIVE AND ALLOW_LIVE_TRADING).
-    Fails CLOSED: on any refusal/error returns None and the engine stays flat."""
-    if not trading_permitted(ig, allow_live):
-        log.error("ORDER REFUSED: trading not permitted -- not a connected DEMO account, or LIVE without "
-                  "the safety chain (mode/ALLOW_LIVE_TRADING) -- staying FLAT.")
-        _audit(epic, "OPEN", direction, size, stop_pts, outcome="REFUSED", reason="trading not permitted (account / live-lock)")
+def place_order(ig, epic, direction, size, stop_pts):
+    """Place an order on the CONNECTED account (DEMO or LIVE -- whichever the trading_mode switch selected).
+    `direction` is 'LONG'/'SHORT'. Returns deal_id or None. Fails CLOSED: on any refusal/error returns None
+    and the engine stays flat. Every audit row records the account (mode) the order was attributed to."""
+    mode = getattr(ig, "account_type", "") or ""
+    if not trading_permitted(ig):
+        log.error("ORDER REFUSED: trading not permitted -- no connected Capital.com account -- staying FLAT.")
+        _audit(epic, "OPEN", direction, size, stop_pts, outcome="REFUSED", mode=mode, reason="no connected account")
         return None
     # Skip cleanly if the market is in a closed window (e.g. Brent's 22:00-00:00 UTC daily break) --
     # avoids a guaranteed-reject order. The engine stays flat and will enter when the market reopens.
     if not market_tradeable(ig, epic):
         log.info("ORDER SKIPPED: %s market is CLOSED (Capital.com) -- staying flat until it reopens.", epic)
-        _audit(epic, "OPEN", direction, size, stop_pts, outcome="SKIPPED_MARKET_CLOSED")
+        _audit(epic, "OPEN", direction, size, stop_pts, outcome="SKIPPED_MARKET_CLOSED", mode=mode)
         return None
     guard = existing_position(ig, epic)
     if guard is not None:          # a position exists, OR we couldn't verify -> refuse
         if guard == "UNKNOWN":
             log.error("ORDER REFUSED: could not verify existing %s positions -- staying FLAT.", epic)
-            _audit(epic, "OPEN", direction, size, stop_pts, outcome="REFUSED", reason="could not verify existing positions")
+            _audit(epic, "OPEN", direction, size, stop_pts, outcome="REFUSED", mode=mode, reason="could not verify existing positions")
         else:
             log.error("ORDER REFUSED: a %s position is already open -- no double-entry.", epic)
-            _audit(epic, "OPEN", direction, size, stop_pts, outcome="REFUSED", reason="double-entry: position already open")
+            _audit(epic, "OPEN", direction, size, stop_pts, outcome="REFUSED", mode=mode, reason="double-entry: position already open")
         return None
     api_dir = "BUY" if direction == "LONG" else "SELL"
     try:
         res = ig.open_position(epic=epic, direction=api_dir, size=size, stop_distance=stop_pts)
     except Exception as exc:
         log.error("ORDER FAILED: open_position raised %s -- staying FLAT.", exc)
-        _audit(epic, "OPEN", direction, size, stop_pts, outcome="FAILED", reason=str(exc))
+        _audit(epic, "OPEN", direction, size, stop_pts, outcome="FAILED", mode=mode, reason=str(exc))
         return None
     deal_id = (res or {}).get("deal_id")
     if not deal_id:
         log.error("ORDER FAILED: open_position returned %s (no deal id) -- staying FLAT.", res)
-        _audit(epic, "OPEN", direction, size, stop_pts, outcome="REJECTED", reason="rejected/failed (no deal id) -- see connector log")
+        _audit(epic, "OPEN", direction, size, stop_pts, outcome="REJECTED", mode=mode, reason="rejected/failed (no deal id) -- see connector log")
         return None
-    log.info("DEMO ORDER PLACED: %s %s size=%.2f stop=%.0fpt | ID: %s",
-             direction, epic, size, stop_pts, deal_id)
-    _audit(epic, "OPEN", direction, size, stop_pts, outcome="ACCEPTED", deal_id=deal_id)
+    log.info("%s ORDER PLACED: %s %s size=%.2f stop=%.0fpt | ID: %s",
+             mode or "?", direction, epic, size, stop_pts, deal_id)
+    _audit(epic, "OPEN", direction, size, stop_pts, outcome="ACCEPTED", deal_id=deal_id, mode=mode)
     return deal_id
 
 
@@ -173,6 +170,7 @@ def sync_stop(ig, epic, stop_level):
     broker-mirrored that cycle. Capital.com may reject a stop too close to spot (min distance) -- benign."""
     if ig is None or stop_level is None:
         return False
+    mode = getattr(ig, "account_type", "") or ""
     pos = existing_position(ig, epic)
     if pos in (None, "UNKNOWN"):
         return False
@@ -188,10 +186,10 @@ def sync_stop(ig, epic, stop_level):
             return True
         log.warning("broker stop sync rejected (%s -> %.2f): HTTP %s %s",
                     epic, round(float(stop_level), 2), r.status_code, r.text[:140])
-        _audit(epic, "STOP_SYNC", stop=stop_level, outcome="REJECTED", deal_id=did, reason="HTTP %s" % r.status_code)
+        _audit(epic, "STOP_SYNC", stop=stop_level, outcome="REJECTED", deal_id=did, mode=mode, reason="HTTP %s" % r.status_code)
     except Exception as exc:
         log.warning("broker stop sync failed (%s): %s", epic, exc)
-        _audit(epic, "STOP_SYNC", stop=stop_level, outcome="FAILED", reason=str(exc))
+        _audit(epic, "STOP_SYNC", stop=stop_level, outcome="FAILED", mode=mode, reason=str(exc))
     return False
 
 
@@ -203,10 +201,11 @@ def close_order(ig, epic, deal_id, direction, size):
     latter closes. If no position exists, a broker stop/TP already closed it -> treat as success."""
     if ig is None:
         return False
+    mode = getattr(ig, "account_type", "") or ""
     pos = existing_position(ig, epic)
     if pos is None:
-        log.info("DEMO ORDER already closed broker-side (stop/TP) | %s | (opened id %s)", epic, deal_id)
-        _audit(epic, "CLOSE", direction, size, outcome="ALREADY_CLOSED", deal_id=deal_id)
+        log.info("%s ORDER already closed broker-side (stop/TP) | %s | (opened id %s)", mode or "?", epic, deal_id)
+        _audit(epic, "CLOSE", direction, size, outcome="ALREADY_CLOSED", deal_id=deal_id, mode=mode)
         return True
     if pos == "UNKNOWN":
         target = deal_id                       # can't look up -> best-effort with the stored id
@@ -219,16 +218,16 @@ def close_order(ig, epic, deal_id, direction, size):
         log.error("close_order raised %s", exc)
         ok = False
     if ok:
-        log.info("DEMO ORDER CLOSED: %s %s | ID: %s", direction, epic, target)
-        _audit(epic, "CLOSE", direction, size, outcome="ACCEPTED", deal_id=target)
+        log.info("%s ORDER CLOSED: %s %s | ID: %s", mode or "?", direction, epic, target)
+        _audit(epic, "CLOSE", direction, size, outcome="ACCEPTED", deal_id=target, mode=mode)
         return True
     # re-verify: gone now?
     if existing_position(ig, epic) is None:
-        log.info("DEMO ORDER closed (verified gone) | %s | ID: %s", epic, target)
-        _audit(epic, "CLOSE", direction, size, outcome="ACCEPTED", deal_id=target, reason="verified gone")
+        log.info("%s ORDER closed (verified gone) | %s | ID: %s", mode or "?", epic, target)
+        _audit(epic, "CLOSE", direction, size, outcome="ACCEPTED", deal_id=target, mode=mode, reason="verified gone")
         return True
-    log.error("DEMO ORDER CLOSE FAILED and position still open | %s | ID: %s", epic, target)
-    _audit(epic, "CLOSE", direction, size, outcome="FAILED", deal_id=target)
+    log.error("%s ORDER CLOSE FAILED and position still open | %s | ID: %s", mode or "?", epic, target)
+    _audit(epic, "CLOSE", direction, size, outcome="FAILED", deal_id=target, mode=mode)
     return False
 
 

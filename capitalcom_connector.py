@@ -44,7 +44,7 @@ class CapitalComConnector:
             price = cap.get_price("FTSE")
     """
 
-    def __init__(self) -> None:
+    def __init__(self, account="DEMO") -> None:
         self._connected           = False
         self._price_cache: dict   = {}   # epic -> (price_dict, timestamp)
 
@@ -52,20 +52,56 @@ class CapitalComConnector:
         self._security_token      = None
         self._session_created_at  = None   # time.monotonic() at last (re)auth
 
-        self._email    = os.getenv("CAPITALCOM_EMAIL",    "")
-        self._password = os.getenv("CAPITALCOM_PASSWORD", "")
-        self._api_key  = os.getenv("CAPITALCOM_API_KEY",  "")
-        self._acc_type = os.getenv("CAPITALCOM_ACC_TYPE", "DEMO")
+        # Shared login e-mail; per-account API key + password (+ optional account id) selected by mode.
+        # DEMO -> demo host, LIVE -> live host. The active account is driven by trading_mode (DEMO/LIVE),
+        # NOT a fixed .env flag -- set_account() re-points and forces a fresh session.
+        self._email = os.getenv("CAPITALCOM_EMAIL", "")
+        self._creds = {
+            "DEMO": {"key": os.getenv("CAPITALCOM_DEMO_KEY", ""),
+                     "password": os.getenv("CAPITALCOM_DEMO_PASSWORD", ""),
+                     "acc_id": os.getenv("CAPITALCOM_DEMO_ACCOUNT_ID", ""),
+                     "base_url": DEMO_BASE_URL},
+            "LIVE": {"key": os.getenv("CAPITALCOM_LIVE_KEY", ""),
+                     "password": os.getenv("CAPITALCOM_LIVE_PASSWORD", ""),
+                     "acc_id": os.getenv("CAPITALCOM_LIVE_ACCOUNT_ID", ""),
+                     "base_url": LIVE_BASE_URL},
+        }
+        self._account = "LIVE" if str(account).strip().upper() == "LIVE" else "DEMO"
+        self._apply_account()
 
-        if not all([self._email, self._password, self._api_key]):
-            log.warning(
-                "Capital.com credentials not fully configured. "
-                "Set CAPITALCOM_EMAIL, CAPITALCOM_PASSWORD, CAPITALCOM_API_KEY in .env"
-            )
+    def _apply_account(self) -> None:
+        """Point the active credentials/base-url at the currently selected account."""
+        c = self._creds[self._account]
+        self._api_key  = c["key"]
+        self._password = c["password"]
+        self._acc_id   = c["acc_id"]
+        self._base_url = c["base_url"]
+        if not all([self._email, self._api_key, self._password]):
+            log.warning("Capital.com %s credentials not fully configured in .env", self._account)
 
-        self._base_url = (
-            LIVE_BASE_URL if self._acc_type.strip().upper() == "LIVE" else DEMO_BASE_URL
-        )
+    def has_credentials(self, account) -> bool:
+        """True when the given account (DEMO/LIVE) has a login e-mail + API key + password configured."""
+        acct = "LIVE" if str(account).strip().upper() == "LIVE" else "DEMO"
+        c = self._creds[acct]
+        return bool(self._email and c["key"] and c["password"])
+
+    def set_account(self, account) -> bool:
+        """Switch the ACTIVE Capital.com account (DEMO<->LIVE). Drops any session so the next connect()
+        authenticates against the new account; returns True on a live re-connect. No-op True if already on
+        that account and connected. Returns False if the requested account has no credentials (fail safe)."""
+        acct = "LIVE" if str(account).strip().upper() == "LIVE" else "DEMO"
+        if acct == self._account and self._connected:
+            return True
+        if not self.has_credentials(acct):
+            log.warning("Refusing to switch to %s -- credentials not configured", acct)
+            return False
+        self._account = acct
+        self._apply_account()
+        self._connected = False
+        self._cst = None
+        self._security_token = None
+        self._session_created_at = None
+        return self.connect()
 
     # ── Connection ────────────────────────────────────────────────────────────
 
@@ -102,10 +138,7 @@ class CapitalComConnector:
                 self._session_created_at = time.monotonic()
                 self._connected          = True
 
-                log.info(
-                    "Excalibur connected to Capital.com (%s)",
-                    self._acc_type.strip().upper() or "DEMO",
-                )
+                log.info("Excalibur connected to Capital.com (%s account)", self._account)
                 return True
             except Exception as exc:
                 log.warning(
@@ -125,8 +158,8 @@ class CapitalComConnector:
 
     @property
     def account_type(self) -> str:
-        """DEMO or LIVE, from CAPITALCOM_ACC_TYPE (read-only; drives the dashboard account tag)."""
-        return (self._acc_type or "DEMO").strip().upper()
+        """The ACTIVE account (DEMO/LIVE) this connector is pointed at -- drives the dashboard account tag."""
+        return self._account
 
     def _refresh_session(self) -> None:
         """Re-authenticate if the session is missing or older than SESSION_MAX_AGE_S."""

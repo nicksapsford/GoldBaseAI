@@ -303,8 +303,7 @@ class PaperTraderGold:
                 return None
             self._bal_at_open = self._real_balance()
             deal_id = place_order(self.ig, LIVE_EPIC, direction,
-                                  self.current_trade.size_oz, self.current_trade.stop_pts,
-                                  allow_live=(trading_mode.read_mode() == "LIVE"))
+                                  self.current_trade.size_oz, self.current_trade.stop_pts)
             if not deal_id:
                 log.error("[OPEN ABORTED] real demo order was not placed -- staying FLAT.")
                 self.current_trade = None
