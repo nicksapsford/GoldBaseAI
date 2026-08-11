@@ -107,6 +107,34 @@ def place_order(ig, epic, direction, size, stop_pts):
     return deal_id
 
 
+def sync_stop(ig, epic, stop_level):
+    """Push the engine's (tightened) stop to Capital.com so the BROKER enforces the locked profit even
+    if the engine dies -- PUT /positions/{dealId} {stopLevel}. Looks up the live position's dealId.
+    Fail-SAFE: on any error/rejection logs a warning and returns False; the engine still enforces the
+    stop via its monitor + close_order, so a failed sync never loses protection, it just isn't
+    broker-mirrored that cycle. Capital.com may reject a stop too close to spot (min distance) -- benign."""
+    if ig is None or stop_level is None:
+        return False
+    pos = existing_position(ig, epic)
+    if pos in (None, "UNKNOWN"):
+        return False
+    did = (pos.get("position", {}) or {}).get("dealId")
+    if not did:
+        return False
+    try:
+        import requests
+        r = requests.put("%s/positions/%s" % (ig._base_url, did),
+                         headers=ig._headers(), json={"stopLevel": round(float(stop_level), 2)}, timeout=8)
+        if r.status_code == 200:
+            log.info("BROKER STOP synced: %s -> %.2f | ID %s", epic, round(float(stop_level), 2), did)
+            return True
+        log.warning("broker stop sync rejected (%s -> %.2f): HTTP %s %s",
+                    epic, round(float(stop_level), 2), r.status_code, r.text[:140])
+    except Exception as exc:
+        log.warning("broker stop sync failed (%s): %s", epic, exc)
+    return False
+
+
 def close_order(ig, epic, deal_id, direction, size):
     """Close a DEMO position. Returns True if closed (or already gone).
 
