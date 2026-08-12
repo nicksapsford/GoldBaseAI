@@ -58,6 +58,8 @@ USE_COMPOUNDING = os.getenv("USE_COMPOUNDING", "False").strip().lower() in ("1",
 RISK_PCT        = _envf("RISK_PCT", 0.02)      # 2% of current balance per trade
 MAX_RISK_PCT    = _envf("MAX_RISK_PCT", 0.05)  # hard safety cap 5%
 MIN_STAKE       = _envf("MIN_STAKE", 0.50)     # Capital.com minimum £/pt
+NOTIONAL_CAPITAL = _envf("NOTIONAL_CAPITAL", 3000.0)  # FIXED sizing capital (Part 1). Sizing/risk
+                                                     # NEVER uses the real (e.g. £31k demo) balance.
 SPREAD_POINTS          = 0.3     # Capital.com gold spread (very low cost)
 DEFAULT_GBPUSD         = 1.27    # conservative fallback if live rate unavailable
 

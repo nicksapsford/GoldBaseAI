@@ -270,16 +270,12 @@ class PaperTraderGold:
                    liquidity_period: str = "") -> Optional[GoldTrade]:
         """Open a trade. When LIVE_EXECUTION is on, place a REAL Capital.com demo order and only report
         the trade as open once Capital.com confirms it (fail CLOSED -> returns None, engine stays flat)."""
-        from strategy_gold import open_trade
+        from strategy_gold import open_trade, NOTIONAL_CAPITAL
         self._gbpusd = gbpusd
-        # STAGE C compounding: size 2% off the REAL account balance (demo £31k / live £3k), not the
-        # price-based paper capital. Ignored when USE_COMPOUNDING=False. Falls back to capital_gbp if the
-        # balance read is unavailable (a smaller, safe size).
-        _basis = self.capital_gbp
-        if LIVE_EXECUTION and self.ig is not None:
-            _rb = self._real_balance()
-            if _rb and _rb > 0:
-                _basis = _rb
+        # Part 1 sizing fix (12 Aug 2026): size off the FIXED notional capital (NOTIONAL_CAPITAL, £3,000),
+        # NEVER the real Capital.com balance. The real balance (e.g. the £31k demo) is still shown as
+        # TOTAL POT on the dashboard but must not drive sizing -- that was making trades ~10x too big.
+        _basis = NOTIONAL_CAPITAL
         self.current_trade = open_trade(direction, price, gbpusd, liquidity_period, balance=_basis)
         # ── STAGE B: when live execution is on, a trade ONLY opens on a confirmed REAL demo order.
         # If the connector is missing/unreachable we STAY FLAT (never silently fall back to paper). ──

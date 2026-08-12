@@ -5,6 +5,7 @@ Gold-specific: 24/7 market, liquidity-period aware, Asian-session tightening.
 """
 
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 import pandas as pd
@@ -18,7 +19,7 @@ log = logging.getLogger("GoldTrader.Lancelot")
 
 # ── Thresholds ────────────────────────────────────────────────────────────────
 
-DAILY_LOSS_LIMIT_GBP    = 60.0   # 6% of £1,000 -- hard stop for the day
+DAILY_LOSS_LIMIT_GBP    = float(os.getenv("DAILY_LOSS_LIMIT_GBP", "180"))  # 6% of £3,000 notional (Part 2)
 MAX_CONSECUTIVE_LOSSES  = 5
 COOLDOWN_MINUTES        = 30
 MIN_TMO_FOR_ENTRY       = 0.3
