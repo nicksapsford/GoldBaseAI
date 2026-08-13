@@ -79,6 +79,48 @@ class CapitalComConnector:
         if not all([self._email, self._api_key, self._password]):
             log.warning("Capital.com %s credentials not fully configured in .env", self._account)
 
+    def _ensure_account_id(self, current_id=None) -> None:
+        """Pin this session to CAPITALCOM_{DEMO,LIVE}_ACCOUNT_ID via PUT /session (Part 2b, 13 Aug 2026).
+
+        A Capital.com LOGIN can hold SEVERAL accounts (the AlbionBase demo login holds 'GBP' and
+        'Account 2', one per machine). /session alone lands on whichever account carries the
+        'preferred' flag, so without this the Dell and the K1 would trade the SAME account while both
+        .env files claimed otherwise. The account id was previously read from .env and then never used.
+
+        No id configured -> no-op (keeps the old preferred-account behaviour).
+        Switch fails -> FAIL CLOSED: we may be sitting on the wrong account, so drop the connection
+        rather than trade it."""
+        want = (self._acc_id or "").strip()
+        if not want:
+            log.warning("No CAPITALCOM_%s_ACCOUNT_ID set -- using the login's 'preferred' account. "
+                        "If this login has more than one account this may be the WRONG one.",
+                        self._account)
+            return
+        if str(current_id or "").strip() == want:
+            log.info("Capital.com session already on %s account %s", self._account, want)
+            return
+        try:
+            resp = requests.put(
+                f"{self._base_url}/session",
+                headers=self._headers(),
+                json={"accountId": want},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            log.info("Capital.com session switched to %s account %s", self._account, want)
+        except Exception as exc:
+            body = ""
+            try:
+                body = exc.response.text if getattr(exc, "response", None) is not None else ""
+            except Exception:
+                body = ""
+            log.error("Could not switch to %s account %s: %s %s -- treating as NOT connected "
+                      "(refusing to trade an unverified account).", self._account, want, exc, body)
+            self._connected = False
+            self._cst = None
+            self._security_token = None
+            self._session_created_at = None
+
     def has_credentials(self, account) -> bool:
         """True when the given account (DEMO/LIVE) has a login e-mail + API key + password configured."""
         acct = "LIVE" if str(account).strip().upper() == "LIVE" else "DEMO"
@@ -137,6 +179,14 @@ class CapitalComConnector:
                 self._security_token     = sec_tok
                 self._session_created_at = time.monotonic()
                 self._connected          = True
+
+                try:
+                    _current = (resp.json() or {}).get("currentAccountId")
+                except Exception:
+                    _current = None
+                self._ensure_account_id(_current)
+                if not self._connected:
+                    return False
 
                 log.info("Excalibur connected to Capital.com (%s account)", self._account)
                 return True
