@@ -44,7 +44,8 @@ from paper_trader_gold import PaperTraderGold, TRADES_LOG, LIVE_EXECUTION as _LI
 import live_executor
 import trading_mode
 from pre_checks_gold import run_all_pre_checks, run_individual_pre_checks, check_kill_switch_reset
-from strategy_gold import should_force_close, get_gbpusd_rate, TIGHT_TRAIL_ACTIVATE_POINTS
+from strategy_gold import (should_force_close, get_gbpusd_rate, TIGHT_TRAIL_ACTIVATE_POINTS,
+                           NOTIONAL_CAPITAL, RISK_PCT)
 import direction_switch
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -389,13 +390,23 @@ def run_candle_tick(feed, stanley, account, ig):
 # ── Account balance (Part 3, READ-ONLY) ───────────────────────────────────────
 # TOTAL POT = the real Capital.com account balance (demo now, live later). Cached 60s so we never
 # hammer the /accounts endpoint. NEVER places an order -- pure read. 2% of it = risk budget per trade.
-_bal_cache = {"ts": 0.0, "balance": None}
+_bal_cache = {"ts": 0.0, "balance": None, "acc_type": None}
 
 
 def get_account_pot(ig):
-    """Return (balance_or_None, acc_type). Cached 60s; keeps last-good on a transient API failure."""
+    """Return (balance_or_None, acc_type). Cached 60s PER ACCOUNT; keeps last-good on a transient
+    API failure.
+
+    Part 1 (13 Aug 2026): the cache used to be keyed on TIME ONLY, while acc_type was read live. So
+    for up to 60 seconds after Nick flipped the DEMO/LIVE switch the dashboard paired the NEW account
+    label with the OLD account's balance -- e.g. a red LIVE banner over the £11,000 demo pot. The
+    cache is now invalidated the moment the account changes, and the stale figure is dropped
+    immediately so the other _bal_cache readers (the Percival 'pot' in the close notifications)
+    cannot serve it either."""
     acc_type = ig.account_type if ig is not None else "DEMO"
     now = time.time()
+    if _bal_cache.get("acc_type") != acc_type:
+        _bal_cache.update(ts=0.0, balance=None, acc_type=acc_type)
     if _bal_cache["balance"] is not None and (now - _bal_cache["ts"]) < 60:
         return _bal_cache["balance"], acc_type
     bal = None
@@ -408,7 +419,7 @@ def get_account_pot(ig):
     except Exception:
         bal = None
     if bal is not None:
-        _bal_cache.update(ts=now, balance=bal)
+        _bal_cache.update(ts=now, balance=bal, acc_type=acc_type)
     return _bal_cache["balance"], acc_type
 
 
@@ -459,7 +470,10 @@ def push_dashboard(stanley, account, mode, ig=None):
                "ladder_step": getattr(trade, "ladder_step", 0), "locked_gbp": locked}
     lanc = "IN TRADE" if stanley.in_trade else _last.get("lancelot", "--")
     pot, acc_type = get_account_pot(ig)
-    risk = round(pot * 0.02, 2) if pot else None
+    # Part 1 (13 Aug 2026): risk per trade is RISK_PCT of the FIXED NOTIONAL_CAPITAL (£60 on £3,000),
+    # matching how the trade is actually sized. It used to be 2% of the real account balance, which
+    # showed £220 against the £11,000 demo pot -- sizing never uses the real balance.
+    risk = round(NOTIONAL_CAPITAL * RISK_PCT, 2)
     payload = {
         "system": "GoldBase", "version": VERSION, "port": PORT,
         "account_balance": pot, "account_type": acc_type,
