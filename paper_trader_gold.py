@@ -303,6 +303,25 @@ class PaperTraderGold:
                 self._bal_at_open = None
                 self._clear_state()
                 return None
+            # ── Part 1 HARD CONTROL (Archie brief, 13 Aug 2026) -- standing rule 7 ──
+            # Never place an order on implausible prices. Runs AFTER normalisation as the final
+            # backstop, so a broken/missing scale correction still cannot reach the broker. The
+            # refusal is logged and Percival-alerted inside price_sane(). Fail CLOSED -> stay FLAT.
+            if not self.ig.price_sane("GBPUSD", gbpusd):
+                log.error("[OPEN ABORTED] GBPUSD sanity check failed (%s) -- staying FLAT.", gbpusd)
+                self.current_trade = None
+                self._bal_at_open = None
+                self._clear_state()
+                return None
+            _bq = self.ig.get_price(LIVE_EPIC)
+            _bmid = (_bq or {}).get("mid")
+            if _bmid is None or not self.ig.price_sane(LIVE_EPIC, _bmid, reference=price):
+                log.error("[OPEN ABORTED] %s broker price sanity check failed (broker=%s vs "
+                          "reference=%s) -- staying FLAT.", LIVE_EPIC, _bmid, price)
+                self.current_trade = None
+                self._bal_at_open = None
+                self._clear_state()
+                return None
             self._bal_at_open = self._real_balance()
             deal_id = place_order(self.ig, LIVE_EPIC, direction,
                                   self.current_trade.size_oz, self.current_trade.stop_pts)

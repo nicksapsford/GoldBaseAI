@@ -179,13 +179,18 @@ def sync_stop(ig, epic, stop_level):
         return False
     try:
         import requests
+        # Part 2 (13 Aug 2026): stop_level is a TRUE price; the broker wants its own quote units.
+        # On a 100x-scaled live Brent an un-rescaled level would sit 100x below spot -- rejected, or
+        # worse, silently accepted as a nonsense stop. No-op on demo (divisor 1).
+        _lvl = round(float(ig.to_broker_price(epic, stop_level)), 2)
         r = requests.put("%s/positions/%s" % (ig._base_url, did),
-                         headers=ig._headers(), json={"stopLevel": round(float(stop_level), 2)}, timeout=8)
+                         headers=ig._headers(), json={"stopLevel": _lvl}, timeout=8)
         if r.status_code == 200:
-            log.info("BROKER STOP synced: %s -> %.2f | ID %s", epic, round(float(stop_level), 2), did)
+            log.info("BROKER STOP synced: %s -> %.2f true (%.2f broker) | ID %s",
+                     epic, round(float(stop_level), 2), _lvl, did)
             return True
-        log.warning("broker stop sync rejected (%s -> %.2f): HTTP %s %s",
-                    epic, round(float(stop_level), 2), r.status_code, r.text[:140])
+        log.warning("broker stop sync rejected (%s -> %.2f true / %.2f broker): HTTP %s %s",
+                    epic, round(float(stop_level), 2), _lvl, r.status_code, r.text[:140])
         _audit(epic, "STOP_SYNC", stop=stop_level, outcome="REJECTED", deal_id=did, mode=mode, reason="HTTP %s" % r.status_code)
     except Exception as exc:
         log.warning("broker stop sync failed (%s): %s", epic, exc)

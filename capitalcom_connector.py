@@ -33,6 +33,56 @@ SESSION_MAX_AGE_S = 9 * 60   # refresh before the 10-minute expiry
 DEMO_BASE_URL = "https://demo-api-capital.backend-capital.com/api/v1"
 LIVE_BASE_URL = "https://api-capital.backend-capital.com/api/v1"
 
+# ── Live/demo price scaling (Part 2, Archie brief 13 Aug 2026) ────────────────
+# Capital.com's LIVE host quotes SOME epics on a different scale to DEMO. Verified side by side
+# 13 Aug 2026 on the same login:
+#     OIL_BRENT   demo    86.866  ->  live  8686.1   (100x)
+#     GBPUSD      demo   1.35006  ->  live 13500.8   (10,000x)
+#     GOLD/US500  identical on both hosts.
+# snapshot.scalingFactor reports 1 on BOTH hosts and does NOT flag this. The only signal is
+# snapshot.decimalPlacesFactor, which drops on live for exactly the affected epics.
+#
+# We store the DEMO baseline (the instrument's true precision) as constants and DERIVE the divisor at
+# runtime from the live decimalPlacesFactor -- never a hardcoded scale factor. If Capital.com changes
+# the scaling, decimalPlacesFactor moves with it and we follow, instead of silently applying a stale
+# correction. Unknown epic or missing field -> divisor 1.0 (no correction) + the Part 1 guard still
+# has to pass, so an unhandled epic fails closed rather than trading on a mis-scaled price.
+DEMO_DECIMAL_PLACES = {"GOLD": 2, "US500": 1, "OIL_BRENT": 3, "GBPUSD": 5}
+
+# ── Fail-closed sanity guard (Part 1) -- HARD CONTROL, standing rule 7 ────────
+# Stays in permanently, even once normalisation is proven. Runs AFTER normalisation as the backstop.
+GBPUSD_SANE_MIN = 0.5
+GBPUSD_SANE_MAX = 5.0
+PRICE_REF_MAX_RATIO = 3.0        # normalised price must sit within [ref/3, ref*3]
+
+_PUSHOVER_API = "https://api.pushover.net/1/messages.json"
+
+
+def percival_price_alert(title: str, message: str) -> None:
+    """Percival alert for a failed price sanity check. Self-contained (no notifier import) so this
+    block stays vendored byte-identical across GoldBase/OilBase/USBase. Gated by LIVE_NOTIFICATIONS
+    + creds; never raises -- a dead notifier must never block the refusal it is reporting."""
+    if os.getenv("LIVE_NOTIFICATIONS", "False").strip().lower() not in ("1", "true", "yes", "on"):
+        return
+    user, token = os.getenv("PUSHOVER_USER_KEY", ""), os.getenv("PUSHOVER_API_TOKEN", "")
+    if not user or not token:
+        return
+    try:
+        mode = "LIVE"
+        try:
+            import trading_mode
+            mode = trading_mode.read_mode()
+        except Exception:
+            pass
+        requests.post(_PUSHOVER_API, data={
+            "token": token, "user": user,
+            "title": "[%s] %s" % (mode, title),
+            "message": message,
+            "priority": 1,          # High -- a refused order needs to be seen
+        }, timeout=8)
+    except Exception:
+        pass
+
 
 class CapitalComConnector:
     """
@@ -47,6 +97,7 @@ class CapitalComConnector:
     def __init__(self, account="DEMO") -> None:
         self._connected           = False
         self._price_cache: dict   = {}   # epic -> (price_dict, timestamp)
+        self._scale_cache: dict   = {}   # epic -> divisor, for the ACTIVE account (cleared on switch)
 
         self._cst                 = None
         self._security_token      = None
@@ -76,8 +127,135 @@ class CapitalComConnector:
         self._password = c["password"]
         self._acc_id   = c["acc_id"]
         self._base_url = c["base_url"]
+        # Scaling is per-HOST -- DEMO and LIVE quote differently, so never carry a divisor across a
+        # switch. Prices are cached too and must not survive an account change.
+        self._scale_cache = {}
+        self._price_cache = {}
         if not all([self._email, self._api_key, self._password]):
             log.warning("Capital.com %s credentials not fully configured in .env", self._account)
+
+    # ── Price scaling (Part 2) + sanity guard (Part 1) ────────────────────────
+
+    def _learn_scale(self, epic: str, snapshot: dict) -> float:
+        """Derive and cache this epic's divisor from a /markets snapshot. Returns the divisor.
+
+        divisor = 10 ** (demo_baseline_dp - live_dp), so:
+            OIL_BRENT on live -> 10 ** (3 - 1) = 100     (8686.1 / 100  = 86.861)
+            GBPUSD    on live -> 10 ** (5 - 1) = 10000   (13500.8/10000 = 1.35008)
+            GOLD/US500        -> 10 ** 0       = 1       (unchanged)
+        On DEMO every epic already reports its true precision, so every divisor is 1."""
+        base = DEMO_DECIMAL_PLACES.get(epic)
+        dp = (snapshot or {}).get("decimalPlacesFactor")
+        if base is None or dp is None:
+            self._scale_cache[epic] = 1.0
+            return 1.0
+        try:
+            divisor = float(10 ** (int(base) - int(dp)))
+        except (TypeError, ValueError):
+            divisor = 1.0
+        if divisor <= 0:
+            divisor = 1.0
+        prev = self._scale_cache.get(epic)
+        self._scale_cache[epic] = divisor
+        if divisor != 1.0 and prev != divisor:
+            log.warning("%s price scaling detected on %s: decimalPlacesFactor=%s vs demo baseline %s "
+                        "-> dividing quotes by %g", epic, self._account, dp, base, divisor)
+        return divisor
+
+    def price_divisor(self, epic: str) -> float:
+        """Cached divisor for `epic` on the ACTIVE account, fetching /markets once if not yet known.
+        Returns 1.0 (no correction) if it cannot be determined."""
+        if epic in self._scale_cache:
+            return self._scale_cache[epic]
+        try:
+            resp = requests.get(f"{self._base_url}/markets/{epic}", headers=self._headers(), timeout=10)
+            resp.raise_for_status()
+            return self._learn_scale(epic, resp.json().get("snapshot", {}))
+        except Exception as exc:
+            log.warning("Could not read decimalPlacesFactor for %s: %s -- assuming no scaling.", epic, exc)
+            self._scale_cache[epic] = 1.0
+            return 1.0
+
+    def normalise_price(self, epic: str, raw):
+        """Broker quote -> TRUE price. Use for every price READ from Capital.com."""
+        try:
+            return float(raw) / self.price_divisor(epic)
+        except (TypeError, ValueError, ZeroDivisionError):
+            return raw
+
+    def to_broker_price(self, epic: str, price):
+        """TRUE price -> broker quote. Use for any absolute level SENT to Capital.com (e.g. stopLevel).
+        Without this a Brent stop level would be sent 100x too low and rejected or filled instantly."""
+        try:
+            return float(price) * self.price_divisor(epic)
+        except (TypeError, ValueError):
+            return price
+
+    def to_broker_distance(self, epic: str, distance):
+        """TRUE point distance -> broker point distance (e.g. stopDistance). Brent's 1.5pt stop must be
+        sent as 150 on a 100x-scaled live quote, otherwise the stop is 100x too tight and the trade is
+        stopped out within seconds."""
+        try:
+            return float(distance) * self.price_divisor(epic)
+        except (TypeError, ValueError):
+            return distance
+
+    def to_broker_size(self, epic: str, size):
+        """TRUE position size -> broker size. The INVERSE of the price scaling.
+
+        Confirmed 13 Aug 2026 from dealingRules.minDealSize, which moves with the quote scale:
+            OIL_BRENT   demo minDealSize 1     ->  live 0.01   (ratio 100, same as the price ratio)
+            GOLD/US500  demo 0.01             ->  live 0.01   (ratio 1, unscaled)
+        A 100x-larger quote means each size unit carries 100x the economic exposure, so the same
+        position is size/100 on live:
+            demo  40    x 86.54 = 3461 exposure
+            live   0.4  x 8654  = 3461 exposure   <- identical
+        The scaling cancels against to_broker_distance(), so risk is preserved exactly:
+            demo  40   x 1.5pt  = $60 risk
+            live   0.4 x 150pt  = $60 risk
+        WITHOUT this, a live Brent order would carry 100x the intended exposure and 100x the risk."""
+        try:
+            return float(size) / self.price_divisor(epic)
+        except (TypeError, ValueError, ZeroDivisionError):
+            return size
+
+    def price_sane(self, epic: str, price, reference=None) -> bool:
+        """HARD CONTROL (Part 1, standing rule 7). True when a NORMALISED price is plausible.
+
+        Runs AFTER normalisation as the final backstop: if normalisation is wrong, missing, or the epic
+        is unknown, this still refuses the trade. Two checks:
+          * GBPUSD must sit inside [0.5, 5.0].
+          * Any epic with a reference price (the yfinance figure the data feed already pulls) must sit
+            within [ref/3, ref*3].
+        Fails CLOSED -- a price it cannot evaluate as sane is not sane."""
+        try:
+            p = float(price)
+        except (TypeError, ValueError):
+            log.error("PRICE SANITY: %s price %r is not a number -- refusing.", epic, price)
+            return False
+        if p <= 0:
+            log.error("PRICE SANITY: %s price %s is not positive -- refusing.", epic, p)
+            return False
+        if epic == "GBPUSD" and not (GBPUSD_SANE_MIN <= p <= GBPUSD_SANE_MAX):
+            msg = ("GBPUSD implausible: %s (outside %s-%s). No orders placed. "
+                   "Check the Capital.com connection." % (p, GBPUSD_SANE_MIN, GBPUSD_SANE_MAX))
+            log.error("PRICE SANITY: %s -- refusing trade", msg)
+            percival_price_alert("Price sanity check failed", msg)
+            return False
+        if reference is not None:
+            try:
+                ref = float(reference)
+            except (TypeError, ValueError):
+                ref = 0.0
+            if ref > 0:
+                hi, lo = ref * PRICE_REF_MAX_RATIO, ref / PRICE_REF_MAX_RATIO
+                if not (lo <= p <= hi):
+                    msg = ("%s price implausible: live %s vs reference %s (allowed %.4f-%.4f). "
+                           "No orders placed." % (epic, p, ref, lo, hi))
+                    log.error("PRICE SANITY: %s -- refusing trade", msg)
+                    percival_price_alert("Price sanity check failed", msg)
+                    return False
+        return True
 
     def _ensure_account_id(self, current_id=None) -> None:
         """Pin this session to CAPITALCOM_{DEMO,LIVE}_ACCOUNT_ID via PUT /session (Part 2b, 13 Aug 2026).
@@ -262,9 +440,15 @@ class CapitalComConnector:
             )
             resp.raise_for_status()
             snap = resp.json().get("snapshot", {})
-            bid  = float(snap.get("bid", 0))
-            ask  = float(snap.get("offer", 0))
-            mid  = round((bid + ask) / 2, 1)
+            # Part 2: learn this epic's scaling from the SAME response (no extra API call), then
+            # normalise. On DEMO the divisor is 1 and these are no-ops.
+            divisor = self._learn_scale(epic, snap)
+            bid  = float(snap.get("bid", 0)) / divisor
+            ask  = float(snap.get("offer", 0)) / divisor
+            # Round the mid to the instrument's TRUE precision. The old fixed 1dp was fine for gold but
+            # destroyed GBPUSD (1.35008 -> 1.4), which is why strategy_gold recomputes its own mid.
+            _dp = DEMO_DECIMAL_PLACES.get(epic, 2)
+            mid  = round((bid + ask) / 2, _dp)
             result = {"bid": bid, "ask": ask, "mid": mid, "epic": epic}
             self._price_cache[epic] = (result, now)
             log.debug("Price %s: bid=%.1f ask=%.1f", epic, bid, ask)
@@ -307,13 +491,16 @@ class CapitalComConnector:
                     return None
 
                 import pandas as pd
+                # Part 2: candles come back on the same scale as the quotes, so normalise them too --
+                # otherwise a live Brent candle series is 100x the real price. No-op on demo.
+                _div = self.price_divisor(epic)
                 rows = []
                 for p in prices:
                     snap_time = p.get("snapshotTime", "")
-                    o_mid = (float(p["openPrice"]["bid"]) + float(p["openPrice"]["ask"])) / 2
-                    h_mid = (float(p["highPrice"]["bid"]) + float(p["highPrice"]["ask"])) / 2
-                    l_mid = (float(p["lowPrice"]["bid"]) + float(p["lowPrice"]["ask"])) / 2
-                    c_mid = (float(p["closePrice"]["bid"]) + float(p["closePrice"]["ask"])) / 2
+                    o_mid = (float(p["openPrice"]["bid"]) + float(p["openPrice"]["ask"])) / 2 / _div
+                    h_mid = (float(p["highPrice"]["bid"]) + float(p["highPrice"]["ask"])) / 2 / _div
+                    l_mid = (float(p["lowPrice"]["bid"]) + float(p["lowPrice"]["ask"])) / 2 / _div
+                    c_mid = (float(p["closePrice"]["bid"]) + float(p["closePrice"]["ask"])) / 2 / _div
                     vol   = float(p.get("lastTradedVolume", 0) or 0)
                     rows.append({
                         "timestamp": snap_time,
@@ -367,6 +554,16 @@ class CapitalComConnector:
             log.error("open_position called but not connected")
             return None
 
+        # Part 2: the stop distance is in TRUE points; the broker wants it in ITS quote units. On a
+        # 100x-scaled live Brent a 1.5pt stop must be sent as 150, otherwise it is 100x too tight and
+        # the position is stopped out within seconds. No-op on demo (divisor 1).
+        broker_stop = self.to_broker_distance(epic, stop_distance)
+        broker_size = self.to_broker_size(epic, size)
+        if broker_stop != stop_distance or broker_size != size:
+            log.warning("SCALED for %s on %s: size %.4f -> %.4f | stop %.4f pt -> %.4f pt "
+                        "(divisor %g) -- exposure and risk are unchanged.",
+                        epic, self._account, float(size), float(broker_size),
+                        float(stop_distance), float(broker_stop), self.price_divisor(epic))
         try:
             resp = requests.post(
                 f"{self._base_url}/positions",
@@ -374,9 +571,9 @@ class CapitalComConnector:
                 json={
                     "direction":       direction,
                     "epic":            epic,
-                    "size":            size,
+                    "size":            broker_size,
                     "guaranteedStop":  False,
-                    "stopDistance":    stop_distance,
+                    "stopDistance":    broker_stop,
                     "stopLevel":       None,
                     "profitDistance":  None,
                     "profitLevel":     None,
