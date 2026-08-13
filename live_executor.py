@@ -218,7 +218,9 @@ def close_order(ig, epic, deal_id, direction, size):
         target = (pos.get("position", {}) or {}).get("dealId") or deal_id
     api_dir = "BUY" if direction == "LONG" else "SELL"
     try:
-        ok = ig.close_position(deal_id=target, direction=api_dir, size=size)
+        # Pass the epic too: close_position now resolves the real dealId itself and uses the epic as
+        # its fallback, so a stale/confirmation id can no longer leave a live position running.
+        ok = ig.close_position(deal_id=target, direction=api_dir, size=size, epic=epic)
     except Exception as exc:
         log.error("close_order raised %s", exc)
         ok = False

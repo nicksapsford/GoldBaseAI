@@ -611,15 +611,30 @@ class CapitalComConnector:
     def close_position(
         self,
         deal_id: str,
-        direction: str,
-        size: float,
+        direction: str = "",
+        size: float = 0.0,
+        epic: str = "",
     ) -> bool:
         """
-        Close an open position by deal_id.
-        direction and size are accepted for interface parity with the old
-        IGConnector -- Capital.com's DELETE /positions/{dealId} closes the
-        whole position and does not require them.
-        Returns True on success.
+        Close an open position. True if it is closed, or was already gone.
+
+        RESOLVES THE REAL dealId ITSELF -- never trusts the id it is handed (hardened 13 Aug 2026
+        after a live incident). open_position() returns a deal CONFIRMATION id which is NOT the id of
+        the resulting position; the two differ by a single character and only the position's own
+        dealId closes anything. Passing the confirmation id returns 404 and the position stays OPEN.
+        That trap previously lived only in live_executor.close_order(), so any other caller of this
+        method could silently leave a real position running. It is now handled here, for every caller.
+
+        Resolution order:
+          1. exact dealId match against the live open positions (an already-correct id);
+          2. `epic`, when exactly one position is open on it;
+          3. otherwise REFUSE.
+
+        direction and size are accepted for interface parity with the old IGConnector; Capital.com's
+        DELETE closes the whole position and does not need them.
+
+        Fails CLOSED: if it cannot positively identify which position to close it returns False and
+        fires no request, rather than firing a DELETE at a guessed id.
         """
         self._refresh_session()
 
@@ -627,18 +642,70 @@ class CapitalComConnector:
             log.error("close_position called but not connected")
             return False
 
+        positions = self.get_open_positions()
+
+        def _pos_of(p):
+            return p.get("position", {}) or {}
+
+        def _epic_of(p):
+            return (p.get("market", {}) or {}).get("epic")
+
+        target = None
+        for p in positions:
+            if deal_id and _pos_of(p).get("dealId") == deal_id:
+                target = deal_id
+                break
+
+        if target is None and epic:
+            matches = [p for p in positions if _epic_of(p) == epic]
+            if len(matches) > 1:
+                log.error("close_position: %d positions open on %s -- ambiguous, refusing to guess.",
+                          len(matches), epic)
+                return False
+            if len(matches) == 1:
+                target = _pos_of(matches[0]).get("dealId")
+                if target != deal_id:
+                    log.warning("close_position: id %s is not a live position (deal confirmation "
+                                "reference?) -- resolved %s to its real dealId %s.",
+                                deal_id, epic, target)
+
+        if target is None:
+            # Nothing to close is the desired end state, not a failure.
+            if epic and not any(_epic_of(p) == epic for p in positions):
+                log.info("close_position: no open %s position -- already closed.", epic)
+                return True
+            if not positions:
+                log.info("close_position: account is flat -- nothing to close (given id %s).", deal_id)
+                return True
+            log.error("close_position: could not resolve a position for deal_id=%s epic=%r among %d "
+                      "open position(s) -- refusing to fire a DELETE at an unverified id.",
+                      deal_id, epic, len(positions))
+            return False
+
         try:
             resp = requests.delete(
-                f"{self._base_url}/positions/{deal_id}",
+                f"{self._base_url}/positions/{target}",
                 headers=self._headers(),
                 timeout=10,
             )
             resp.raise_for_status()
             deal_ref = resp.json().get("dealReference", "")
-            log.info("Position closed | deal_id=%s | ref=%s", deal_id, deal_ref)
+            log.info("Position closed | deal_id=%s | ref=%s", target, deal_ref)
             return True
         except Exception as exc:
-            log.error("close_position failed: %s", exc)
+            body = ""
+            try:
+                body = exc.response.text if getattr(exc, "response", None) is not None else ""
+            except Exception:
+                body = ""
+            log.error("close_position failed for %s: %s %s", target, exc, body)
+            # Re-verify: a broker stop/TP may have closed it underneath us.
+            try:
+                if not any(_pos_of(p).get("dealId") == target for p in self.get_open_positions()):
+                    log.info("close_position: %s is gone on re-check -- treating as closed.", target)
+                    return True
+            except Exception:
+                pass
             return False
 
     def get_open_positions(self) -> list:
