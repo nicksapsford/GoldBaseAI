@@ -1,10 +1,11 @@
 """
-GoldTrader AI -- notifier_gold.py  (Percival)
-Pushover push notifications. All failures are silent/logged.
-Loads credentials from .env (shared Pushover account). All notifications
-prefixed [GOLD].
+GoldBase A.I. -- notifier_gold.py  (Percival)
+================================================================================
+AlbionBase push notifications via Pushover. EVERY notification is marked [DEMO] or [LIVE] from
+trading_mode.json (Part 4a) so Nick always knows which Capital.com account is affected. Priorities
+follow the 12 Aug 2026 brief (Part 4d): a LIVE event is always louder than the equivalent DEMO event.
+Gated by LIVE_NOTIFICATIONS -- only AlbionBase is enabled; every other desk stays silent.
 """
-
 import logging
 import os
 from pathlib import Path
@@ -20,159 +21,216 @@ if _ENV_PATH.exists():
 else:
     load_dotenv()
 
-log = logging.getLogger("GoldTrader.Percival")
+import trading_mode                     # [DEMO]/[LIVE] marker source
+try:
+    import ledger                       # Pot + true Trading P&L (balance - net invested)
+except Exception:
+    ledger = None
+
+log = logging.getLogger("GoldBase.Percival")
 
 _PUSHOVER_API = "https://api.pushover.net/1/messages.json"
-_USER         = os.getenv("PUSHOVER_USER_KEY",  "")
-_TOKEN        = os.getenv("PUSHOVER_API_TOKEN", "")
-# LIVE_NOTIFICATIONS (.env, per-machine): True on K1 live only. Default False -> Dell paper is SILENT
-# for ALL trade notifications (brief Part 5). Hardware/process alerts come from the System Monitor,
-# which is separate and unaffected by this flag.
+_USER  = os.getenv("PUSHOVER_USER_KEY",  "")
+_TOKEN = os.getenv("PUSHOVER_API_TOKEN", "")
 _LIVE_NOTIFICATIONS = os.getenv("LIVE_NOTIFICATIONS", "False").strip().lower() in ("1", "true", "yes", "on")
+_NOTIONAL = os.getenv("NOTIONAL_CAPITAL", "3000")
 
-_P_NORMAL = 0
-_P_HIGH   = 1
+# ── Per-instrument ────────────────────────────────────────────────────────────
+SYS = "GoldBase"
+
+
+def _px(p):
+    try:
+        return "$%s" % format(float(p), ",.2f")
+    except Exception:
+        return str(p)
+
+
+# Pushover priority: -1 low, 0 normal, 1 high, 2 emergency (retry until acknowledged).
+_P_LOW, _P_NORMAL, _P_HIGH, _P_EMERGENCY = -1, 0, 1, 2
+
+
+def _m():
+    try:
+        return trading_mode.read_mode()
+    except Exception:
+        return "DEMO"
+
+
+def _prio(demo, live):
+    """LIVE events are always at least as loud as the DEMO equivalent (Part 4d)."""
+    return live if _m() == "LIVE" else demo
+
+
+def _money(v):
+    try:
+        v = float(v)
+        return ("+£%.2f" % v) if v >= 0 else ("-£%.2f" % abs(v))
+    except Exception:
+        return str(v)
+
+
+def _dur(d):
+    if d is None:
+        return ""
+    if isinstance(d, str):
+        return d
+    try:
+        s = int(d); h = s // 3600; m = (s % 3600) // 60
+        return ("%dh %dm" % (h, m)) if h else ("%dm" % m)
+    except Exception:
+        return ""
+
+
+def _pot_line(pot):
+    """'\\nPot: £X | Trading P&L: +£Y' -- omitted if the pot isn't known."""
+    if pot is None:
+        return ""
+    try:
+        pot = float(pot)
+        tp = ledger.trading_pnl(pot) if ledger else None
+        tps = (" | Trading P&L: %s" % _money(tp)) if tp is not None else ""
+        return "\nPot: £%s%s" % (format(pot, ",.2f"), tps)
+    except Exception:
+        return ""
 
 
 def _send(title: str, message: str, priority: int = _P_NORMAL) -> None:
+    """Post a Pushover notification, title auto-prefixed [DEMO]/[LIVE]. Silent unless LIVE_NOTIFICATIONS."""
     if not _LIVE_NOTIFICATIONS:
-        log.debug("LIVE_NOTIFICATIONS off (paper) -- suppressed: %s", title)
+        log.debug("LIVE_NOTIFICATIONS off -- suppressed: %s", title)
         return
     if not _USER or not _TOKEN:
         log.debug("Pushover not configured -- skipping: %s", title)
         return
+    full = "[%s] %s" % (_m(), title)
+    data = {"token": _TOKEN, "user": _USER, "title": full, "message": message, "priority": priority}
+    if priority >= _P_EMERGENCY:          # emergency must retry + expire
+        data["retry"] = 60
+        data["expire"] = 3600
     try:
-        resp = requests.post(
-            _PUSHOVER_API,
-            data={"token": _TOKEN, "user": _USER, "title": title,
-                  "message": message, "priority": priority},
-            timeout=5,
-        )
-        if resp.status_code == 200:
-            log.debug("Notification sent: %s", title)
-        else:
-            log.warning("Pushover HTTP %d for: %s", resp.status_code, title)
+        r = requests.post(_PUSHOVER_API, data=data, timeout=5)
+        if r.status_code != 200:
+            log.warning("Pushover HTTP %s for: %s", r.status_code, full)
     except Exception as exc:
-        log.warning("Pushover notification failed (%s): %s", title, exc)
+        log.warning("Pushover notification failed (%s): %s", full, exc)
 
 
-# ── Public notification functions ─────────────────────────────────────────────
-
+# ── Trading notifications (Part 1) ────────────────────────────────────────────
 def notify_trade_opened(direction, entry_price, stop_loss, take_profit, stake,
                         liquidity_period="", size_oz=0.0) -> None:
+    try:
+        risk = float(stake) * abs(float(entry_price) - float(stop_loss))
+    except Exception:
+        risk = 0.0
     _send(
-        title   = "[GOLD] Trade Opened -- GoldTrader AI",
-        message = (
-            f"{direction} opened at ${entry_price:,.2f}\n"
-            f"Stop: ${stop_loss:,.2f} | Target: ${take_profit:,.2f}\n"
-            f"Size: {size_oz:.2f}oz | Stake: £{stake:.4f}/pt | {liquidity_period}"
-        ),
+        "%s — %s opened" % (SYS, direction),
+        "Entry: %s | Stop: %s | Stake: £%.2f/pt\nRisk: £%.0f (2%% of £%s)" % (
+            _px(entry_price), _px(stop_loss), stake, risk, format(float(_NOTIONAL), ",.0f")),
+        _prio(_P_LOW, _P_NORMAL),
     )
 
 
 def notify_trade_closed_win(direction, exit_price, points_gained, pnl_gbp,
-                            capital, reason) -> None:
+                            capital, reason, pot=None, duration=None) -> None:
+    dur = _dur(duration)
     _send(
-        title   = "[GOLD] Trade WON -- GoldTrader AI",
-        message = (
-            f"{direction} closed at ${exit_price:,.2f}\n"
-            f"Points: +{points_gained:.1f} | P&L: +£{pnl_gbp:.2f}\n"
-            f"Capital: £{capital:.2f} | Reason: {reason}"
-        ),
+        "%s — %s closed ✅ %s" % (SYS, direction, _money(pnl_gbp)),
+        "Exit: %s%s%s" % (_px(exit_price), (" | Duration: %s" % dur) if dur else "", _pot_line(pot)),
+        _prio(_P_LOW, _P_NORMAL),
     )
 
 
 def notify_trade_closed_loss(direction, exit_price, points_gained, pnl_gbp,
-                             capital, reason) -> None:
+                             capital, reason, pot=None, duration=None) -> None:
+    dur = _dur(duration)
+    rtxt = (" | %s" % reason) if reason else ""
     _send(
-        title   = "[GOLD] Trade Lost -- GoldTrader AI",
-        message = (
-            f"{direction} closed at ${exit_price:,.2f}\n"
-            f"Points: {points_gained:.1f} | P&L: -£{abs(pnl_gbp):.2f}\n"
-            f"Capital: £{capital:.2f} | Reason: {reason}"
-        ),
-    )
-
-
-def notify_kill_switch_triggered(tier, reason, wait_hours, daily_pnl, capital) -> None:
-    _send(
-        title   = f"[GOLD] KILL SWITCH Tier {tier} -- GoldTrader AI",
-        message = (
-            f"{reason}\nDaily P&L: £{daily_pnl:+.2f}\n"
-            f"Auto-resume in {wait_hours}h | Capital: £{capital:.2f}"
-        ),
-        priority = _P_HIGH,
-    )
-
-
-def notify_kill_switch_reset(tier, wait_hours, capital) -> None:
-    _send(
-        title   = "[GOLD] Trading Resuming -- GoldTrader AI",
-        message = (
-            f"Kill switch reset after {wait_hours}h cooldown (Tier {tier}).\n"
-            f"Capital: £{capital:.2f}. Watching for Gold setups."
-        ),
-    )
-
-
-def notify_system_startup(capital, mode="PAPER") -> None:
-    _send(
-        title   = f"[GOLD] GoldTrader AI Started ({mode})",
-        message = (
-            f"GoldTrader AI is live.\nCapital: £{capital:.2f} | Mode: {mode}\n"
-            f"Trading Gold spot (XAU) via Capital.com spread betting."
-        ),
-    )
-
-
-def notify_system_shutdown(capital) -> None:
-    _send(
-        title   = "[GOLD] GoldTrader AI Shutdown",
-        message = f"GoldTrader AI stopped cleanly.\nFinal capital: £{capital:.2f}",
-    )
-
-
-def notify_calendar_block(event_name, mins_remaining) -> None:
-    _send(
-        title   = "[GOLD] Calendar Block Active",
-        message = f"Trading paused: {event_name}\n{mins_remaining} min remaining. Will resume automatically.",
+        "%s — %s closed ❌ %s" % (SYS, direction, _money(pnl_gbp)),
+        "Exit: %s%s%s%s" % (_px(exit_price), rtxt, (" | Duration: %s" % dur) if dur else "", _pot_line(pot)),
+        _prio(_P_LOW, _P_NORMAL),
     )
 
 
 def notify_two_speed_activated(activation_pts, locked_gbp, stop_price) -> None:
-    """Two-speed trail engaged -- profit now locked (brief Part 5)."""
     _send(
-        title   = "[GOLD] Profit Locked -- two-speed trail",
-        message = (
-            f"Two-speed trail activated at +{activation_pts:.0f}pt profit.\n"
-            f"Locked: +£{locked_gbp:.2f}\nStop now: ${stop_price:,.2f}"
-        ),
+        "%s — Trail tightened 🔒" % SYS,
+        "Profit locked: £%.2f | Stop: %s" % (locked_gbp, _px(stop_price)),
+        _prio(_P_LOW, _P_NORMAL),
     )
+
+
+# ── System notifications (Part 2) ─────────────────────────────────────────────
+def notify_kill_switch_triggered(tier, reason, wait_hours, daily_pnl, capital) -> None:
+    limit = os.getenv("DAILY_LOSS_LIMIT_GBP", "180")
+    _send(
+        "%s — KILL SWITCH ⛔" % SYS,
+        "Daily loss limit hit: -£%s\nNo new trades until tomorrow UTC" % limit,
+        _prio(_P_NORMAL, _P_HIGH),
+    )
+
+
+def notify_external_close(direction, pnl_gbp, reason="unknown", pot=None) -> None:
+    live = (_m() == "LIVE")
+    _send(
+        "%s — External close detected ⚠️" % SYS,
+        "Position closed by Capital.com (not by engine)\nP&L: %s | Reason: %s\nCheck Capital.com account%s%s" % (
+            _money(pnl_gbp), reason, (" immediately" if live else ""), _pot_line(pot)),
+        _prio(_P_NORMAL, _P_HIGH),
+    )
+
+
+def notify_margin_rejection(reason="Insufficient margin") -> None:
+    live = (_m() == "LIVE")
+    _send(
+        "%s — Order rejected ⚠️" % SYS,
+        "Reason: %s\nSystem remains flat%s" % (reason, (" — check account balance" if live else "")),
+        _prio(_P_NORMAL, _P_HIGH),
+    )
+
+
+def notify_system_restart(reason="crash") -> None:
+    """Fired by the watchdog after it detects a crash/freeze and relaunches (Part 2)."""
+    live = (_m() == "LIVE")
+    _send(
+        "%s — System restarted ⚠️" % SYS,
+        "Watchdog detected crash and relaunched\n%s" % (
+            "Check Capital.com for open positions immediately" if live else "Check dashboard for open positions"),
+        _prio(_P_NORMAL, _P_EMERGENCY),
+    )
+
+
+def notify_kill_switch_reset(tier, wait_hours, capital) -> None:
+    _send("%s — Trading resuming" % SYS,
+          "Kill switch reset after %sh cooldown. Watching for setups." % wait_hours,
+          _prio(_P_LOW, _P_NORMAL))
+
+
+def notify_system_startup(capital, mode="") -> None:
+    _send("%s — started" % SYS, "%s is live. Account mode: %s." % (SYS, _m()), _P_LOW)
+
+
+def notify_system_shutdown(capital) -> None:
+    _send("%s — shutdown" % SYS, "%s stopped cleanly." % SYS, _P_LOW)
+
+
+def notify_calendar_block(event_name, mins_remaining) -> None:
+    _send("%s — calendar block" % SYS,
+          "Trading paused: %s (%s min). Resumes automatically." % (event_name, mins_remaining), _P_LOW)
 
 
 def notify_daily_summary(date_str, trades, pnl_gbp, capital, win_rate) -> None:
-    _send(
-        title   = f"[GOLD] Daily Summary {date_str}",
-        message = (
-            f"Trades: {trades} | P&L: £{pnl_gbp:+.2f}\n"
-            f"Win rate: {win_rate:.1f}% | Capital: £{capital:.2f}"
-        ),
-    )
+    _send("%s — daily %s" % (SYS, date_str),
+          "Trades: %s | P&L: %s | WR: %.0f%%" % (trades, _money(pnl_gbp), win_rate), _P_LOW)
 
 
 def notify_milestone_review(milestone_num) -> None:
-    _send(
-        title   = f"[GOLD] Milestone Review #{milestone_num} -- Arthur",
-        message = (
-            f"Arthur has completed his {milestone_num * 50}-trade review.\n"
-            f"Check logs/arthur_gold_review_{milestone_num:02d}.txt for insights."
-        ),
-    )
+    _send("%s — milestone #%s" % (SYS, milestone_num), "Review complete.", _P_LOW)
 
 
 def notify_system_error(error_msg) -> None:
-    _send(
-        title   = "[GOLD] System Error -- GoldTrader AI",
-        message = f"Error detected:\n{error_msg[:200]}",
-        priority = _P_HIGH,
-    )
+    _send("%s — system error ⚠️" % SYS, "Error: %s" % str(error_msg)[:200], _prio(_P_NORMAL, _P_HIGH))
+
+
+def notify_event_block(reason) -> None:
+    _send("%s — event block" % SYS, "High-impact event: %s. New entries paused." % reason, _P_LOW)

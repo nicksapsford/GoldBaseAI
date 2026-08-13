@@ -37,7 +37,8 @@ from capitalcom_connector import CapitalComConnector
 from notifier_gold import (
     notify_system_startup, notify_trade_opened,
     notify_trade_closed_win, notify_trade_closed_loss, notify_system_error,
-    notify_two_speed_activated,
+    notify_two_speed_activated, notify_external_close, notify_margin_rejection,
+    notify_kill_switch_triggered,
 )
 from paper_trader_gold import PaperTraderGold, TRADES_LOG, LIVE_EXECUTION as _LIVE_EXECUTION
 import live_executor
@@ -189,7 +190,7 @@ def _open(stanley, ig, direction, price, period, gbpusd):
     if trade is None:
         # STAGE B: the real demo order was refused/failed -> stay FLAT, alert, do NOT retry.
         try:
-            notify_system_error("GoldBase: demo order placement FAILED -- staying flat (no auto-retry).")
+            notify_margin_rejection("Order rejected -- see logs/order_audit.csv")
         except Exception:
             pass
         log.error("OPEN FAILED: real demo order not placed -- remaining FLAT.")
@@ -209,13 +210,20 @@ def _on_close(stanley, account, price, reason):
     if trade is None:
         return
     account.record_trade(trade.pnl_gbp)
+    _dur = None
+    try:
+        if getattr(trade, "entry_time", None):
+            _dur = (datetime.now(timezone.utc) - trade.entry_time).total_seconds()
+    except Exception:
+        _dur = None
+    _pot = _bal_cache.get("balance")   # last-known real Capital.com balance (cached, no extra call)
     try:
         if trade.pnl_gbp >= 0:
             notify_trade_closed_win(trade.direction, price, trade.points_gained,
-                                    trade.pnl_gbp, account.capital_gbp, reason)
+                                    trade.pnl_gbp, account.capital_gbp, reason, pot=_pot, duration=_dur)
         else:
             notify_trade_closed_loss(trade.direction, price, trade.points_gained,
-                                     trade.pnl_gbp, account.capital_gbp, reason)
+                                     trade.pnl_gbp, account.capital_gbp, reason, pot=_pot, duration=_dur)
     except Exception as exc:
         log.warning("Percival close notify failed: %s", exc)
     log.info("CLOSED %s @ $%.2f | %s | pts=%+.2f | P&L=£%+.2f | capital=£%.2f",
@@ -235,6 +243,25 @@ def _maybe_notify_two_speed(trade) -> None:
         except Exception as exc:
             log.warning("two-speed notify failed: %s", exc)
         trade._two_speed_notified = True
+
+
+_kill_notified = False
+
+
+def _maybe_notify_kill_switch(account) -> None:
+    """Fire ONE kill-switch Pushover the moment it activates; re-arm when it resets (Part 2)."""
+    global _kill_notified
+    if getattr(account, "kill_switch_active", False):
+        if not _kill_notified:
+            _kill_notified = True
+            try:
+                notify_kill_switch_triggered(getattr(account, "kill_switch_tier", 1),
+                                             getattr(account, "kill_switch_reason", ""), 0,
+                                             account.daily_pnl_gbp, account.capital_gbp)
+            except Exception as exc:
+                log.warning("kill-switch notify failed: %s", exc)
+    else:
+        _kill_notified = False
 
 
 # ── Periodic position reconciliation (Part 2, 11 Aug 2026) ──────────────────────────────────────
@@ -272,7 +299,9 @@ def _reconcile_external_close(stanley, account, ig, price, gbpusd) -> bool:
         if trade is not None:
             account.record_trade(trade.pnl_gbp)
         try:
-            notify_system_error("Position closed externally on Gold -- check Capital.com.")
+            notify_external_close(trade.direction if trade else "?",
+                                  trade.pnl_gbp if trade else 0.0,
+                                  reason="unknown", pot=_bal_cache.get("balance"))
         except Exception:
             pass
         return True
@@ -541,6 +570,7 @@ def main() -> None:
             now_utc = datetime.now(timezone.utc)
             account.maybe_reset_daily(now_utc)  # Benchmark daily-reset fix
             _sync_account(ig, stanley)  # follow the DEMO/LIVE switch (flat-only)
+            _maybe_notify_kill_switch(account)  # one Pushover on kill-switch activation
 
             if check_kill_switch_reset(account):
                 account.kill_switch_tier = 0

@@ -56,6 +56,11 @@ def main() -> None:
             return
 
         log.warning("Engine exited (rc=%s) after %.0fs -- restarting.", rc, ran_for)
+        try:
+            from notifier_gold import notify_system_restart
+            notify_system_restart("crash rc=%s" % rc)   # AlbionBase Part 2 restart alert
+        except Exception as _e:
+            log.warning("restart notify failed: %s", _e)
         now = time.monotonic()
         recent_failures = [t for t in recent_failures if (now - t) < RAPID_WINDOW]
         recent_failures.append(now)
