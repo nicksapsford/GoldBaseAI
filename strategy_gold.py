@@ -120,6 +120,23 @@ def calculate_compounding_stake(balance: float, stop_pts: float = TRAILING_STOP_
     return max(stake, MIN_STAKE)
 
 
+def exceeds_max_risk(stake: float, stop_pts: float, basis: Optional[float] = None) -> bool:
+    """Hard control (standing rule 7) -- Part 6 floor fix, 13 Aug 2026.
+
+    calculate_compounding_stake applies the MAX_RISK_PCT cap to risk_amount BEFORE flooring the stake
+    at MIN_STAKE, so at very low sizing capital the floor silently wins and the resulting trade risks
+    MORE than the 5% cap. This re-checks the risk AFTER the floor has been applied.
+
+    True  -> the stake breaches MAX_RISK_PCT of the sizing capital; DO NOT TRADE.
+    Fails CLOSED: unknown/zero capital or a bad stop also returns True.
+    At realistic capital (>~£500 with a 40pt stop) this never fires."""
+    if basis is None:
+        basis = NOTIONAL_CAPITAL
+    if basis <= 0 or stop_pts <= 0:
+        return True
+    return (stake * stop_pts) > (basis * MAX_RISK_PCT) + 1e-9
+
+
 def calculate_stake(stop_pts: float = TRAILING_STOP_POINTS,
                     gbpusd: float = DEFAULT_GBPUSD) -> float:
     """Return £ risk per point for the given stop distance (= size_oz / gbpusd)."""
@@ -331,7 +348,7 @@ class GoldTrade:
 
 def open_trade(direction: str, price: float, gbpusd: float,
                liquidity_period: str = "", stop_pts: float = TRAILING_STOP_POINTS,
-               balance: float = 0.0) -> GoldTrade:
+               balance: float = 0.0) -> Optional[GoldTrade]:
     trade = GoldTrade(
         direction        = direction,
         entry_price      = round(price, 2),
@@ -341,6 +358,15 @@ def open_trade(direction: str, price: float, gbpusd: float,
         liquidity_period = liquidity_period,
         balance          = balance,
     )
+    # Part 6 (13 Aug 2026): hard MAX_RISK_PCT re-check AFTER the MIN_STAKE floor. Fail CLOSED.
+    if exceeds_max_risk(trade.stake, trade.stop_pts):
+        log.warning(
+            "[TRADE REFUSED] MAX_RISK_PCT breach | %s | stake=£%.4f/pt x stop=%.1fpt = £%.2f risk > "
+            "%.1f%% of £%.2f (cap £%.2f). MIN_STAKE floor (£%.2f) overrode the cap -- staying FLAT.",
+            direction, trade.stake, trade.stop_pts, trade.stake * trade.stop_pts,
+            MAX_RISK_PCT * 100, NOTIONAL_CAPITAL, NOTIONAL_CAPITAL * MAX_RISK_PCT, MIN_STAKE,
+        )
+        return None
     log.info(
         ">>> TRADE OPENED | %s | entry=$%.2f | size=%.2foz | stake=£%.4f/pt | "
         "stop=$%.2f | target=$%.2f | %s | GBPUSD=%.4f",

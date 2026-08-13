@@ -277,6 +277,12 @@ class PaperTraderGold:
         # TOTAL POT on the dashboard but must not drive sizing -- that was making trades ~10x too big.
         _basis = NOTIONAL_CAPITAL
         self.current_trade = open_trade(direction, price, gbpusd, liquidity_period, balance=_basis)
+        # Part 6 (13 Aug 2026): strategy REFUSED the trade on a MAX_RISK_PCT breach -- stay FLAT.
+        # The reason is already logged by strategy_gold.open_trade.
+        if self.current_trade is None:
+            self._bal_at_open = None
+            self._clear_state()
+            return None
         # ── STAGE B: when live execution is on, a trade ONLY opens on a confirmed REAL demo order.
         # If the connector is missing/unreachable we STAY FLAT (never silently fall back to paper). ──
         if LIVE_EXECUTION:

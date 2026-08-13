@@ -32,9 +32,13 @@ NEW_YORK = "NEW_YORK"     # 17:00-20:30 UTC -- high volume
 CLOSING  = "CLOSING"      # 20:30-21:00 UTC -- pre-close, no entries
 CLOSED   = "CLOSED"       # 21:00-22:00 daily break + weekend
 
-# Daily break: 21:00-22:00 UTC. Weekly: opens Sun 22:00 UTC, closes Fri 21:00 UTC.
-DAILY_BREAK_START_MIN = 21 * 60   # 21:00 UTC
-DAILY_BREAK_END_MIN   = 22 * 60   # 22:00 UTC
+# Daily break: 20:45-22:00 UTC. Weekly: opens Sun 22:00 UTC, closes Fri 20:45 UTC.
+# Part 5 (13 Aug 2026): was 21:00. Capital.com's confirmed gold close is 20:45 UTC, so the gate was
+# 15 minutes LOOSE -- the engine believed the market was open 20:45-21:00 when it was already shut.
+# 20:45 also matches this system's own FORCE_CLOSE_START_MIN in strategy_gold.py, which already
+# force-closes and blocks new entries from 20:45, so this only removes a window that was dead anyway.
+DAILY_BREAK_START_MIN = 20 * 60 + 45   # 20:45 UTC
+DAILY_BREAK_END_MIN   = 22 * 60        # 22:00 UTC
 
 
 # ── Market hours / liquidity logic ────────────────────────────────────────────
