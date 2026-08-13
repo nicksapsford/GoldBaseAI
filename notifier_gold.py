@@ -207,7 +207,9 @@ def notify_kill_switch_reset(tier, wait_hours, capital) -> None:
 
 
 def notify_system_startup(capital, mode="") -> None:
-    _send("%s — started" % SYS, "%s is live. Account mode: %s." % (SYS, _m()), _P_LOW)
+    """Suppressed (Nick, 12 Aug 2026): a routine restart must NOT push. No-op so engine calls still work.
+    A genuine CRASH still alerts -- via the watchdog's notify_system_restart, which is separate."""
+    return
 
 
 def notify_system_shutdown(capital) -> None:
