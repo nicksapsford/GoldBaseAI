@@ -29,8 +29,10 @@ import pandas as pd
 
 try:
     from . import polygon_fetcher as pf
+    from . import swing_levels as sl
 except ImportError:
     import polygon_fetcher as pf
+    import swing_levels as sl
 import data_feed_gold as feed
 import pre_checks_gold as pc
 import strategy_gold as strat
@@ -53,8 +55,12 @@ def _enriched(tf: str) -> pd.DataFrame:
     return df
 
 
+FORCE_CLOSE_MIN = 20 * 60 + 45        # 20:45 UTC force-close (strategy_gold.FORCE_CLOSE_START_MIN)
+
+
 def run_baseline(verbose: bool = True) -> list:
     five = _enriched("5min"); hour = _enriched("1hour"); daily = _enriched("daily")
+    hour_rows = hour[["timestamp", "high", "low", "close"]].to_dict("records")   # for Compass swing levels
 
     ft = five["epoch"].to_numpy()
     fo, fh, fl, fc = (five[c].to_numpy(dtype=float) for c in ("open", "high", "low", "close"))
@@ -84,7 +90,7 @@ def run_baseline(verbose: bool = True) -> list:
             # a data gap (weekend / daily break) while still open -> force out at the previous bar's close
             if i > 0 and (ft[i] - ft[i - 1]) > GAP_SECS:
                 trade.close(fc[i - 1], "FORCE_CLOSE", BT_GBPUSD)
-                _record(trades, trade, direction); in_trade = False
+                _record(trades, trade, direction, i - 1); in_trade = False
                 if trade.pnl_gbp < 0:
                     cooldown_until = ft[i - 1] + COOLDOWN_SECS
                 # fall through: this bar may open a new trade below
@@ -93,7 +99,7 @@ def run_baseline(verbose: bool = True) -> list:
                 hi, lo, op = fh[i], fl[i], fc[i]
                 if strat.should_force_close(now):
                     trade.close(fo[i], "FORCE_CLOSE", BT_GBPUSD)
-                    _record(trades, trade, direction); in_trade = False
+                    _record(trades, trade, direction, i); in_trade = False
                     if trade.pnl_gbp < 0:
                         cooldown_until = ft[i] + COOLDOWN_SECS
                     continue
@@ -109,7 +115,7 @@ def run_baseline(verbose: bool = True) -> list:
                     else:                                  trade.update_trailing_stop(lo)
                 if exit_reason:
                     trade.close(exit_price, exit_reason, BT_GBPUSD)
-                    _record(trades, trade, direction); in_trade = False
+                    _record(trades, trade, direction, i); in_trade = False
                     if trade.pnl_gbp < 0:
                         cooldown_until = ft[i] + COOLDOWN_SECS
                 continue
@@ -151,6 +157,18 @@ def run_baseline(verbose: bool = True) -> list:
 
         trade = strat.GoldTrade(direction=direction, entry_price=fc[i], stop_pts=strat.TRAILING_STOP_POINTS,
                                 gbpusd_entry=BT_GBPUSD, entry_time=now, balance=0.0)
+        # ── Compass annotation (analysis only; does NOT gate here -- Session 3 evaluates offline) ──
+        swings = sl.detect(current_price=fc[i], rows=hour_rows[max(0, hidx - 71): hidx + 1])
+        if direction == "LONG":
+            target, upside = swings["nearest_resistance"], swings["upside_to_resistance"]
+        else:
+            target, upside = swings["nearest_support"], swings["downside_to_support"]
+        trade._entry_i = i
+        # minutes to the NEXT 20:45 force-close (wraps to tomorrow for the overnight 22:00+ session)
+        mins_to_fc = FORCE_CLOSE_MIN - hm if hm < FORCE_CLOSE_MIN else FORCE_CLOSE_MIN - hm + 1440
+        trade._compass = {"target": target, "upside_pts": round(upside, 2),
+                          "rr": round(upside / strat.TRAILING_STOP_POINTS, 3),
+                          "mins_to_fc": mins_to_fc}
         in_trade = True
 
     if verbose:
@@ -158,7 +176,8 @@ def run_baseline(verbose: bool = True) -> list:
     return trades
 
 
-def _record(trades, trade, direction):
+def _record(trades, trade, direction, exit_i):
+    c = getattr(trade, "_compass", {})
     trades.append({
         "direction": direction,
         "entry": round(trade.entry_price, 2),
@@ -169,6 +188,11 @@ def _record(trades, trade, direction):
         "mfe": trade.mfe_pts,
         "mae": trade.mae_pts,
         "entry_time": trade.entry_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "holding_bars": exit_i - getattr(trade, "_entry_i", exit_i),   # 5-min bars held
+        "rr": c.get("rr"),                   # Compass R:R at entry (upside-to-target / stop)
+        "upside_pts": c.get("upside_pts"),   # points to the nearest target level
+        "target": c.get("target"),           # the resistance (LONG) / support (SHORT) level
+        "mins_to_fc": c.get("mins_to_fc"),   # minutes from entry to the 20:45 force-close
     })
 
 
