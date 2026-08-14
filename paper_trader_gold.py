@@ -40,6 +40,7 @@ CSV_HEADERS = [
     "stake_per_point", "points_gained", "pnl_usd", "pnl_gbp", "gbpusd_rate",
     "exit_reason", "capital_after_gbp",
     "entry_time", "exit_time", "liquidity_period",
+    "mae_pts", "mae_gbp", "mfe_pts", "mfe_gbp",
 ]
 
 
@@ -175,6 +176,10 @@ class PaperTraderGold:
             "entry_time":        entry_t.strftime("%Y-%m-%d %H:%M:%S"),
             "exit_time":         exit_t.strftime("%Y-%m-%d %H:%M:%S"),
             "liquidity_period":  trade.liquidity_period,
+            "mae_pts":           f"{trade.mae_pts:.2f}",
+            "mae_gbp":           f"{trade.mae_gbp:.2f}",
+            "mfe_pts":           f"{trade.mfe_pts:.2f}",
+            "mfe_gbp":           f"{trade.mfe_gbp:.2f}",
         }
         with open(TRADES_LOG, "a", newline="", encoding="utf-8") as f:
             csv.DictWriter(f, fieldnames=CSV_HEADERS).writerow(row)
@@ -386,6 +391,7 @@ class PaperTraderGold:
         if gbpusd is not None:
             self._gbpusd = gbpusd
         moved = self.current_trade.update_trailing_stop(price)
+        self.current_trade.update_excursions(price)   # MFE/MAE logging (Commission 025)
         rung = self.current_trade.apply_profit_ladder(price)   # Profit ladder (Variant 2)
         if rung:
             self._log_ladder_step(rung)

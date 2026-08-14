@@ -32,7 +32,7 @@ TRAILING_STOP_POINTS   = 40.0    # trailing stop in gold points ($/oz). GoldBase
                                  # (avg win ~20pt; only 3/21 wins reached >=45pt). 40pt lets winners
                                  # breathe. MAX_RISK unchanged: stake auto-drops ~£0.67->£0.50/pt so a
                                  # full stop still loses ~£20.
-TAKE_PROFIT_POINTS     = 90.0    # scalp target. GoldBase v1.0.2: raised 50->90 (Commission 019) -- the
+TAKE_PROFIT_POINTS     = 25.0    # Commission 025 exit fix (14 Aug 2026): banks the common move before the trail gives it back    # scalp target. GoldBase v1.0.2: raised 50->90 (Commission 019) -- the
                                  # 50pt cap capped winners below Gold's real range (best-ever move 67pt);
                                  # 90/40 = 2.25:1 R:R (was 1.67:1). Rarely hit by limit -- its job is to
                                  # stop capping runners; the two-speed trail (v1.0.3) banks the move.
@@ -100,13 +100,15 @@ def calculate_size(stop_pts: float = TRAILING_STOP_POINTS,
                    gbpusd: float = DEFAULT_GBPUSD,
                    risk_gbp: float = MAX_RISK_PER_TRADE_GBP) -> float:
     """
-    Position size in troy ounces so that a full stop-out loses ~risk_gbp.
-      risk_gbp = stop_pts * size_oz / gbpusd   =>   size_oz = risk_gbp * gbpusd / stop_pts
-    At GBPUSD 1.3376 this is ~0.89 oz for a 30pt stop and £20 risk.
+    Position size (£/pt) so a full stop-out loses ~risk_gbp. SIZING FIX (14 Aug 2026): Capital.com spread
+    betting settles P&L in GBP DIRECTLY -- size in £/pt maps 1:1, NO gbpusd conversion. The old
+    `* gbpusd` made every real position ~35% too big (£81 risk vs £60 design). `gbpusd` kept in the
+    signature for call-site compatibility but no longer used.
+      risk_gbp = stop_pts * size   =>   size = risk_gbp / stop_pts
     """
     if stop_pts <= 0:
         return 0.0
-    return round(risk_gbp * gbpusd / stop_pts, 2)
+    return round(risk_gbp / stop_pts, 2)
 
 
 def calculate_compounding_stake(balance: float, stop_pts: float = TRAILING_STOP_POINTS) -> float:
@@ -139,9 +141,8 @@ def exceeds_max_risk(stake: float, stop_pts: float, basis: Optional[float] = Non
 
 def calculate_stake(stop_pts: float = TRAILING_STOP_POINTS,
                     gbpusd: float = DEFAULT_GBPUSD) -> float:
-    """Return £ risk per point for the given stop distance (= size_oz / gbpusd)."""
-    size_oz = calculate_size(stop_pts, gbpusd)
-    return round(size_oz / gbpusd, 4) if gbpusd > 0 else 0.0
+    """Return £/pt for the given stop distance. GBP-settled: size IS the £/pt stake (no gbpusd)."""
+    return calculate_size(stop_pts, gbpusd)
 
 
 def calculate_entry(current_price: float, direction: str) -> float:
@@ -162,15 +163,15 @@ def calculate_take_profit(entry_price: float, direction: str,
 def calculate_pnl(entry_price: float, exit_price: float, direction: str,
                   size_oz: float, gbpusd: float) -> tuple:
     """
-    Return (points_gained, pnl_usd, pnl_gbp), net of spread.
-      points_gained = price move in USD points (minus spread)
-      pnl_usd       = points_gained * size_oz  ($1/oz per point)
-      pnl_gbp       = pnl_usd / gbpusd
+    Return (points_gained, pnl_usd, pnl_gbp), net of spread. SIZING FIX (14 Aug 2026): GBP-settled, so
+    P&L = points * size directly in GBP -- no `/ gbpusd`. `gbpusd` kept for signature compatibility.
+      points_gained = price move (minus spread)
+      pnl_gbp       = points_gained * size   (real GBP, matches the account)
     """
     raw_pts = (exit_price - entry_price) if direction == "LONG" else (entry_price - exit_price)
     points  = raw_pts - SPREAD_POINTS
-    pnl_usd = points * size_oz
-    pnl_gbp = pnl_usd / gbpusd if gbpusd > 0 else 0.0
+    pnl_gbp = points * size_oz
+    pnl_usd = pnl_gbp                      # GBP-settled -> equal; kept for the CSV column
     return round(points, 2), round(pnl_usd, 2), round(pnl_gbp, 2)
 
 
@@ -211,10 +212,10 @@ class GoldTrade:
         if self.size_oz <= 0:                        # size only at NEW entry (reloaded trades keep size)
             if USE_COMPOUNDING and self.balance and self.balance > 0:
                 stake = calculate_compounding_stake(self.balance, self.stop_pts)
-                self.size_oz = round(stake * self.gbpusd_entry, 4)          # oz from the £/pt stake
+                self.size_oz = round(stake, 4)          # GBP-settled: size = the £/pt stake (no gbpusd)
             else:
                 self.size_oz = calculate_size(self.stop_pts, self.gbpusd_entry)   # fixed MAX_RISK (paper)
-        self.stake        = round(self.size_oz / self.gbpusd_entry, 4) if self.gbpusd_entry > 0 else 0.0
+        self.stake        = round(self.size_oz, 4)      # GBP-settled: £/pt IS the size (no gbpusd)
         self.trail_best   = self.entry_price
         self.stop_loss    = calculate_stop_loss(self.entry_price, self.direction, self.stop_pts)
         self.take_profit  = calculate_take_profit(self.entry_price, self.direction)
@@ -310,6 +311,35 @@ class GoldTrade:
             if price >= self.stop_loss:   return "STOP_LOSS"
             if price <= self.take_profit: return "TAKE_PROFIT"
         return None
+
+    def update_excursions(self, price: float) -> None:
+        """MAE/MFE tracking (Commission 009/025). Peak favourable + worst adverse excursion in points from
+        entry, each monitor tick. Analysis only -- never affects stops/exits. Lets Gaius optimise the TP
+        from MEASURED peaks instead of reconstructing them."""
+        if not hasattr(self, "_mfe_pts"):
+            self._mfe_pts = 0.0
+            self._mae_pts = 0.0
+        fav = (price - self.entry_price) if self.direction == "LONG" else (self.entry_price - price)
+        if fav > self._mfe_pts:
+            self._mfe_pts = fav
+        if -fav > self._mae_pts:
+            self._mae_pts = -fav
+
+    @property
+    def mfe_pts(self) -> float:
+        return round(getattr(self, "_mfe_pts", 0.0), 2)
+
+    @property
+    def mae_pts(self) -> float:
+        return round(getattr(self, "_mae_pts", 0.0), 2)
+
+    @property
+    def mfe_gbp(self) -> float:
+        return round(getattr(self, "_mfe_pts", 0.0) * self.stake, 2)
+
+    @property
+    def mae_gbp(self) -> float:
+        return round(getattr(self, "_mae_pts", 0.0) * self.stake, 2)
 
     def close(self, price: float, reason: str, gbpusd: float) -> None:
         """Record exit and compute USD + GBP P&L at the given GBPUSD rate."""
