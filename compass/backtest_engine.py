@@ -45,8 +45,8 @@ GAP_SECS = 90 * 60                    # >90-min bar gap => a break/weekend; forc
 BT_GBPUSD = 1.27                      # fixed (GBP-settled; only affects the retired usd column)
 
 
-def _enriched(tf: str) -> pd.DataFrame:
-    df = pd.DataFrame(pf.load(tf))
+def _enriched(tf: str, loader=None) -> pd.DataFrame:
+    df = pd.DataFrame((loader or pf.load)(tf))
     df["dt"] = pd.to_datetime(df["timestamp"], utc=True)
     df = df.sort_values("dt").reset_index(drop=True)
     df = feed.add_indicators(df)
@@ -58,8 +58,9 @@ def _enriched(tf: str) -> pd.DataFrame:
 FORCE_CLOSE_MIN = 20 * 60 + 45        # 20:45 UTC force-close (strategy_gold.FORCE_CLOSE_START_MIN)
 
 
-def run_baseline(verbose: bool = True) -> list:
-    five = _enriched("5min"); hour = _enriched("1hour"); daily = _enriched("daily")
+def run_baseline(verbose: bool = True, strat_mod=None, loader=None) -> list:
+    _strat = strat_mod or strat        # instrument strategy module (Gold default; Silver etc. for other runs)
+    five = _enriched("5min", loader); hour = _enriched("1hour", loader); daily = _enriched("daily", loader)
     hour_rows = hour[["timestamp", "high", "low", "close"]].to_dict("records")   # for Compass swing levels
 
     ft = five["epoch"].to_numpy()
@@ -97,7 +98,7 @@ def run_baseline(verbose: bool = True) -> list:
             else:
                 now = datetime.fromtimestamp(int(ft[i]), timezone.utc)
                 hi, lo, op = fh[i], fl[i], fc[i]
-                if strat.should_force_close(now):
+                if _strat.should_force_close(now):
                     trade.close(fo[i], "FORCE_CLOSE", BT_GBPUSD)
                     _record(trades, trade, direction, i); in_trade = False
                     if trade.pnl_gbp < 0:
@@ -155,7 +156,7 @@ def run_baseline(verbose: bool = True) -> list:
         if not pc.check_choppy_market(bar1h, bar5m)["passed"]:                continue
         if not pc.check_candle_confirmed(bar1h, bar5m)["passed"]:             continue
 
-        trade = strat.GoldTrade(direction=direction, entry_price=fc[i], stop_pts=strat.TRAILING_STOP_POINTS,
+        trade = _strat.GoldTrade(direction=direction, entry_price=fc[i], stop_pts=_strat.TRAILING_STOP_POINTS,
                                 gbpusd_entry=BT_GBPUSD, entry_time=now, balance=0.0)
         # ── Compass annotation (analysis only; does NOT gate here -- Session 3 evaluates offline) ──
         swings = sl.detect(current_price=fc[i], rows=hour_rows[max(0, hidx - 71): hidx + 1])
@@ -167,7 +168,7 @@ def run_baseline(verbose: bool = True) -> list:
         # minutes to the NEXT 20:45 force-close (wraps to tomorrow for the overnight 22:00+ session)
         mins_to_fc = FORCE_CLOSE_MIN - hm if hm < FORCE_CLOSE_MIN else FORCE_CLOSE_MIN - hm + 1440
         trade._compass = {"target": target, "upside_pts": round(upside, 2),
-                          "rr": round(upside / strat.TRAILING_STOP_POINTS, 3),
+                          "rr": round(upside / _strat.TRAILING_STOP_POINTS, 3),
                           "mins_to_fc": mins_to_fc}
         in_trade = True
 

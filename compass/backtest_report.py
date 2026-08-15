@@ -13,9 +13,9 @@ def _pf(wins_pts, losses_pts):
     return (gross_w / gross_l) if gross_l else float("inf")
 
 
-def report(trades: list):
+def report(trades: list, stake: float = LIVE_STAKE_GBP, title: str = ""):
     bar = "=" * 66
-    print("\n" + bar); print("MERLIN'S COMPASS -- SESSION 2 BASELINE BACKTEST (Gold, no Compass)"); print(bar)
+    print("\n" + bar); print(title or "MERLIN'S COMPASS -- SESSION 2 BASELINE BACKTEST (Gold, no Compass)"); print(bar)
     if not trades:
         print("no trades produced -- check the data / warmup."); return
 
@@ -36,8 +36,8 @@ def report(trades: list):
     print("  date range          : %s  ->  %s" % (trades[0]["entry_time"][:10], trades[-1]["entry_time"][:10]))
     print("  win rate            : %.1f%%   (%d win / %d loss)" % (wr, len(wins), len(losses)))
     print("  PROFIT FACTOR       : %.2f" % pf)
-    print("  net points          : %+.1f pt   (= £%+.2f at £%.2f/pt)" % (net, net * LIVE_STAKE_GBP, LIVE_STAKE_GBP))
-    print("  expectancy / trade  : %+.2f pt   (= £%+.2f)" % (expectancy, expectancy * LIVE_STAKE_GBP))
+    print("  net points          : %+.1f pt   (= £%+.2f at £%.2f/pt)" % (net, net * stake, stake))
+    print("  expectancy / trade  : %+.2f pt   (= £%+.2f)" % (expectancy, expectancy * stake))
     print("  avg win / avg loss  : +%.1f pt / %.1f pt   (payoff %.2f)"
           % (avg_w, avg_l, (avg_w / abs(avg_l)) if avg_l else float("inf")))
     print("  best / worst trade  : %+.1f pt / %+.1f pt" % (max(pts), min(pts)))
