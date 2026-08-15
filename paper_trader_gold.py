@@ -14,7 +14,7 @@ from typing import Optional
 
 import pandas as pd
 
-from strategy_gold import GoldTrade, TRAILING_STOP_POINTS, DEFAULT_GBPUSD
+from strategy_gold import GoldTrade, TRAILING_STOP_POINTS, DEFAULT_GBPUSD, TAKE_PROFIT_POINTS
 from live_executor import place_order, close_order, existing_position, sync_stop
 import trading_mode
 
@@ -329,7 +329,8 @@ class PaperTraderGold:
                 return None
             self._bal_at_open = self._real_balance()
             deal_id = place_order(self.ig, LIVE_EPIC, direction,
-                                  self.current_trade.size_oz, self.current_trade.stop_pts)
+                                  self.current_trade.size_oz, self.current_trade.stop_pts,
+                                  take_profit_pts=TAKE_PROFIT_POINTS)
             if not deal_id:
                 log.error("[OPEN ABORTED] real demo order was not placed -- staying FLAT.")
                 self.current_trade = None
@@ -402,7 +403,7 @@ class PaperTraderGold:
             # profit even if the engine dies (fail-safe -- the engine still enforces it via close_order).
             if LIVE_EXECUTION and self.ig is not None and getattr(self.current_trade, "deal_id", None):
                 try:
-                    sync_stop(self.ig, LIVE_EPIC, self.current_trade.stop_loss)
+                    sync_stop(self.ig, LIVE_EPIC, self.current_trade.stop_loss, tp_level=self.current_trade.take_profit)
                 except Exception:
                     pass
         reason = self.current_trade.check_exit(price)

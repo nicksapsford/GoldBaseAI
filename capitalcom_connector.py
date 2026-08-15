@@ -64,6 +64,12 @@ def percival_price_alert(title: str, message: str) -> None:
     + creds; never raises -- a dead notifier must never block the refusal it is reporting."""
     if os.getenv("LIVE_NOTIFICATIONS", "False").strip().lower() not in ("1", "true", "yes", "on"):
         return
+    try:                                  # STANDING RULE: Pushover ONLY in LIVE mode (K1); DEMO/unknown = silent
+        import trading_mode as _tm
+        if _tm.read_mode() != "LIVE":
+            return
+    except Exception:
+        return
     user, token = os.getenv("PUSHOVER_USER_KEY", ""), os.getenv("PUSHOVER_API_TOKEN", "")
     if not user or not token:
         return
@@ -540,6 +546,7 @@ class CapitalComConnector:
         direction: str = "BUY",
         size: float = 0.25,
         stop_distance: float = 40.0,
+        take_profit: float = None,
     ) -> Optional[dict]:
         """
         Open a position on Capital.com.
@@ -559,6 +566,8 @@ class CapitalComConnector:
         # the position is stopped out within seconds. No-op on demo (divisor 1).
         broker_stop = self.to_broker_distance(epic, stop_distance)
         broker_size = self.to_broker_size(epic, size)
+        # Part 2 (broker-side TP): send profitDistance so the TP survives an engine crash (was hardcoded None).
+        broker_tp = self.to_broker_distance(epic, take_profit) if take_profit else None
         if broker_stop != stop_distance or broker_size != size:
             log.warning("SCALED for %s on %s: size %.4f -> %.4f | stop %.4f pt -> %.4f pt "
                         "(divisor %g) -- exposure and risk are unchanged.",
@@ -575,7 +584,7 @@ class CapitalComConnector:
                     "guaranteedStop":  False,
                     "stopDistance":    broker_stop,
                     "stopLevel":       None,
-                    "profitDistance":  None,
+                    "profitDistance":  broker_tp,
                     "profitLevel":     None,
                 },
                 timeout=10,

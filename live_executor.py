@@ -120,7 +120,7 @@ def market_tradeable(ig, epic):
     return True
 
 
-def place_order(ig, epic, direction, size, stop_pts):
+def place_order(ig, epic, direction, size, stop_pts, take_profit_pts=None):
     """Place an order on the CONNECTED account (DEMO or LIVE -- whichever the trading_mode switch selected).
     `direction` is 'LONG'/'SHORT'. Returns deal_id or None. Fails CLOSED: on any refusal/error returns None
     and the engine stays flat. Every audit row records the account (mode) the order was attributed to."""
@@ -146,7 +146,8 @@ def place_order(ig, epic, direction, size, stop_pts):
         return None
     api_dir = "BUY" if direction == "LONG" else "SELL"
     try:
-        res = ig.open_position(epic=epic, direction=api_dir, size=size, stop_distance=stop_pts)
+        res = ig.open_position(epic=epic, direction=api_dir, size=size, stop_distance=stop_pts,
+                                   take_profit=take_profit_pts)
     except Exception as exc:
         log.error("ORDER FAILED: open_position raised %s -- staying FLAT.", exc)
         _audit(epic, "OPEN", direction, size, stop_pts, outcome="FAILED", mode=mode, reason=str(exc))
@@ -162,7 +163,7 @@ def place_order(ig, epic, direction, size, stop_pts):
     return deal_id
 
 
-def sync_stop(ig, epic, stop_level):
+def sync_stop(ig, epic, stop_level, tp_level=None):
     """Push the engine's (tightened) stop to Capital.com so the BROKER enforces the locked profit even
     if the engine dies -- PUT /positions/{dealId} {stopLevel}. Looks up the live position's dealId.
     Fail-SAFE: on any error/rejection logs a warning and returns False; the engine still enforces the

@@ -100,6 +100,9 @@ def _send(title: str, message: str, priority: int = _P_NORMAL) -> None:
     if not _LIVE_NOTIFICATIONS:
         log.debug("LIVE_NOTIFICATIONS off -- suppressed: %s", title)
         return
+    if _m() != "LIVE":                    # STANDING RULE: Pushover ONLY in LIVE mode (K1 live box); DEMO = log-only
+        log.debug("trading_mode DEMO -- Pushover suppressed (log only): %s", title)
+        return
     if not _USER or not _TOKEN:
         log.debug("Pushover not configured -- skipping: %s", title)
         return
