@@ -13,7 +13,7 @@ def _pf(wins_pts, losses_pts):
     return (gross_w / gross_l) if gross_l else float("inf")
 
 
-def report(trades: list, stake: float = LIVE_STAKE_GBP, title: str = ""):
+def report(trades: list, stake: float = LIVE_STAKE_GBP, title: str = "", tp_level: float = 25):
     bar = "=" * 66
     print("\n" + bar); print(title or "MERLIN'S COMPASS -- SESSION 2 BASELINE BACKTEST (Gold, no Compass)"); print(bar)
     if not trades:
@@ -65,8 +65,8 @@ def report(trades: list, stake: float = LIVE_STAKE_GBP, title: str = ""):
         reach = sum(1 for m in mfes if m >= lo)
         print("   %3d-%-4s   %5d  %5.1f%%      %5.1f%%" % (lo, (hi if hi < 9999 else "+"), c,
                                                            100.0 * c / total, 100.0 * reach / total))
-    print("  --> %% of trades whose peak reached the 25pt TP level: %.1f%%"
-          % (100.0 * sum(1 for m in mfes if m >= 25) / total))
+    print("  --> %% of trades whose peak reached the %gpt TP level: %.1f%%"
+          % (tp_level, 100.0 * sum(1 for m in mfes if m >= tp_level) / total))
 
     print("\n[YEARLY STABILITY]")
     for yr in sorted({t["entry_time"][:4] for t in trades}):
