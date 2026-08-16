@@ -15,6 +15,3 @@ logs/*.txt
 logs/*.json
 logs/*.flag
 !logs/.gitkeep
-
-# Merlin's Compass -- large local candle caches, never commit
-compass/data/
