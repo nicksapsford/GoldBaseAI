@@ -82,11 +82,12 @@ signal.signal(signal.SIGINT, _handle_signal)
 signal.signal(signal.SIGTERM, _handle_signal)
 
 
-def _today_realised_pnl(csv_path) -> float:
-    """Sum today's (UTC) realised P&L from the trade-log CSV (Today P&L Persist Fix,
-    30 Jul 2026). Lets a mid-day restart keep the 'today' counter accurate instead of
-    resetting to zero. Only CLOSED trades are in this CSV, so open positions are excluded.
-    Robust: missing file / no trades today / bad rows -> 0.0. All timestamps are UTC."""
+def _today_realised_pnl(csv_path, account=None) -> float:
+    """Sum today's (UTC) realised P&L from the trade-log CSV. ACCOUNT ISOLATION (17 Aug 2026): when `account`
+    (DEMO/LIVE) is given, count ONLY that account's trades -- so the live kill switch never inherits demo P&L
+    and vice versa. Legacy rows with no `account` column are EXCLUDED from an account-filtered sum (they
+    predate isolation and must not contaminate either account). Only CLOSED trades are in this CSV.
+    Robust: missing file / no trades / bad rows -> 0.0. All timestamps UTC."""
     import csv as _csv
     from datetime import datetime as _dt, timezone as _tz
     from pathlib import Path as _Path
@@ -95,6 +96,7 @@ def _today_realised_pnl(csv_path) -> float:
         if not p.exists():
             return 0.0
         today = _dt.now(_tz.utc).strftime("%Y-%m-%d")
+        want = account.strip().upper() if account else None
         total = 0.0
         with p.open(newline="", encoding="utf-8") as fh:
             for row in _csv.DictReader(fh):
@@ -103,6 +105,8 @@ def _today_realised_pnl(csv_path) -> float:
                     d = (row.get("entry_time") or "").strip()[:10]
                 if d != today:
                     continue
+                if want is not None and (row.get("account") or "").strip().upper() != want:
+                    continue                       # only this account's trades (legacy blank-account rows excluded)
                 try:
                     total += float(row.get("pnl_gbp") or 0.0)
                 except (TypeError, ValueError):
@@ -153,6 +157,21 @@ class AccountState:
         self.kill_switch_reason = ""
         log.info("New UTC trading day %s -- daily P&L + kill switch reset.", today)
         return True
+
+    def reset_for_account_switch(self, account_label, csv_path) -> None:
+        """ACCOUNT ISOLATION (17 Aug 2026). On a DEMO<->LIVE switch the two accounts must NOT share state --
+        a demo loss must never block live (cooldown/consec) or trip the live kill switch, and vice versa.
+        Clear cooldown / consecutive-loss / daily-loss-kill state, then reseed today's realised P&L from THIS
+        account's trades only. Each account starts clean."""
+        self.consecutive_losses = 0
+        self.last_loss_time = None
+        self.kill_switch_active = False
+        self.kill_switch_tier = 0
+        self.kill_switch_until = None
+        self.kill_switch_reason = ""
+        self.daily_pnl_gbp = _today_realised_pnl(csv_path, account=account_label)
+        log.warning("ACCOUNT ISOLATION: state reset for %s -- cooldown/consec/kill cleared; today P&L reseeded "
+                    "to GBP %.2f from %s trades only.", account_label, self.daily_pnl_gbp, account_label)
 
 
 # ── SSL 3-timeframe agreement (the benchmark's direction signal) ──────────────
@@ -295,8 +314,15 @@ def _reconcile_external_close(stanley, account, ig, price, gbpusd) -> bool:
     _recon["fails"] = 0
     if pos is None:                            # CONFIRMED closed externally
         deal_id = getattr(stanley.current_trade, "deal_id", None)
-        log.warning("EXTERNAL CLOSE detected: GOLD position gone on Capital.com (deal %s) -- booking + FLAT.", deal_id)
-        trade = stanley.close_trade(price, "EXTERNAL_CLOSE", gbpusd)
+        # P&L ACCURACY (17 Aug 2026): read the ACTUAL close fill from Capital.com history rather than
+        # estimating the exit from the last price feed, so the CSV matches the broker. Fail-safe: fall back
+        # to the estimate if history is unavailable.
+        _entry = getattr(stanley.current_trade, "entry_price", None)
+        _real = live_executor.external_close_price(ig, GOLD_EPIC, entry_price=_entry)
+        _exit_px = _real if _real is not None else price
+        log.warning("EXTERNAL CLOSE detected: GOLD position gone on Capital.com (deal %s) -- booking at %s%s + FLAT.",
+                    deal_id, _exit_px, "" if _real is not None else " (ESTIMATED -- history unavailable)")
+        trade = stanley.close_trade(_exit_px, "EXTERNAL_CLOSE", gbpusd)
         if trade is not None:
             account.record_trade(trade.pnl_gbp)
         try:
@@ -499,11 +525,13 @@ def push_dashboard(stanley, account, mode, ig=None):
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
-def _sync_account(ig, stanley):
+def _sync_account(ig, stanley, account=None):
     """Follow the DEMO/LIVE switch. If trading_mode changed and we are FLAT, re-point the connector at the
     selected Capital.com account (reconnects). NEVER switches accounts while a position is open -- that
     position is managed on the account it was opened on until it closes (the RoundTableBase switch is
-    itself blocked while a position is open). Fail-safe: any error leaves the current account untouched."""
+    itself blocked while a position is open). Fail-safe: any error leaves the current account untouched.
+    ACCOUNT ISOLATION (17 Aug 2026): on a successful switch, reset AccountState so the new account starts
+    clean (no inherited cooldown / consecutive-loss / daily-loss-kill from the other account)."""
     try:
         import trading_mode
         desired = trading_mode.read_mode()
@@ -513,6 +541,8 @@ def _sync_account(ig, stanley):
             return
         if ig.set_account(desired):
             log.warning("ACCOUNT SWITCHED to %s (trading_mode=%s)", ig.account_type, desired)
+            if account is not None:
+                account.reset_for_account_switch(ig.account_type, TRADES_LOG)   # isolate: clean state per account
         else:
             log.warning("ACCOUNT SWITCH to %s refused (credentials not configured?) -- staying on %s",
                         desired, ig.account_type)
@@ -553,11 +583,12 @@ def main() -> None:
     else:
         log.info("Stage B live execution OFF (LIVE_EXECUTION=False) -- paper simulation only.")
     account = AccountState(capital=stanley.capital_gbp)
-    # Today P&L Persist Fix (30 Jul 2026): seed the in-memory daily tally from today's
-    # closed trades so a mid-day restart keeps the 'today' figure instead of resetting to 0.
-    account.daily_pnl_gbp = _today_realised_pnl(TRADES_LOG)
+    # Today P&L Persist Fix (30 Jul 2026) + ACCOUNT ISOLATION (17 Aug 2026): seed the in-memory daily tally
+    # from today's closed trades FOR THE CURRENT ACCOUNT ONLY, so a live restart never inherits demo P&L.
+    account.daily_pnl_gbp = _today_realised_pnl(TRADES_LOG, account=trading_mode.read_mode())
     if account.daily_pnl_gbp:
-        log.info("Restored today's realised P&L from trade log: GBP %.2f", account.daily_pnl_gbp)
+        log.info("Restored today's realised P&L (%s account) from trade log: GBP %.2f",
+                 trading_mode.read_mode(), account.daily_pnl_gbp)
     try:
         notify_system_startup(capital=stanley.capital_gbp, mode=trading_mode.read_mode())
     except Exception:
@@ -583,7 +614,7 @@ def main() -> None:
             now = time.monotonic()
             now_utc = datetime.now(timezone.utc)
             account.maybe_reset_daily(now_utc)  # Benchmark daily-reset fix
-            _sync_account(ig, stanley)  # follow the DEMO/LIVE switch (flat-only)
+            _sync_account(ig, stanley, account)  # follow the DEMO/LIVE switch (flat-only) + isolate state
             _maybe_notify_kill_switch(account)  # one Pushover on kill-switch activation
 
             if check_kill_switch_reset(account):

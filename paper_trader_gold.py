@@ -41,6 +41,7 @@ CSV_HEADERS = [
     "exit_reason", "capital_after_gbp",
     "entry_time", "exit_time", "liquidity_period",
     "mae_pts", "mae_gbp", "mfe_pts", "mfe_gbp",
+    "account",   # ACCOUNT ISOLATION (17 Aug 2026): DEMO / LIVE -- which real account this trade was on
 ]
 
 
@@ -155,6 +156,17 @@ class PaperTraderGold:
             log.warning("Could not restore state (%s) -- starting fresh", exc)
             self._clear_state()
 
+    def _account_label(self) -> str:
+        """DEMO / LIVE -- which real Capital.com account this trade was on (account isolation).
+        Prefer the connected account type; fall back to the trading_mode switch."""
+        acc = getattr(self.ig, "account_type", None)
+        if acc in ("DEMO", "LIVE"):
+            return acc
+        try:
+            return trading_mode.read_mode()
+        except Exception:
+            return "DEMO"
+
     def _log_trade(self, trade: GoldTrade) -> None:
         if trade.exit_price is None:
             return
@@ -180,6 +192,7 @@ class PaperTraderGold:
             "mae_gbp":           f"{trade.mae_gbp:.2f}",
             "mfe_pts":           f"{trade.mfe_pts:.2f}",
             "mfe_gbp":           f"{trade.mfe_gbp:.2f}",
+            "account":           self._account_label(),   # DEMO / LIVE (account isolation)
         }
         with open(TRADES_LOG, "a", newline="", encoding="utf-8") as f:
             csv.DictWriter(f, fieldnames=CSV_HEADERS).writerow(row)

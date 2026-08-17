@@ -275,6 +275,55 @@ def close_order(ig, epic, deal_id, direction, size):
     return False
 
 
+def external_close_price(ig, epic, entry_price=None):
+    """Best-effort ACTUAL close fill price from Capital.com /history/transactions, for EXTERNAL_CLOSE trades
+    (a position Nick closed manually) where the engine would otherwise estimate the exit from the last price
+    feed. Returns a TRUE price (float) or None -> the caller falls back to the estimate. Read-only; never raises.
+
+    Matching: prefer the transaction whose openLevel matches `entry_price` (each position has a unique entry);
+    else the most recent transaction for this instrument that carries a close level. Levels come back in the
+    broker's quote units, so we divide by the epic's scale divisor to get the TRUE price (no-op on demo)."""
+    try:
+        import requests
+        from datetime import timedelta
+        frm = (datetime.now(timezone.utc) - timedelta(hours=8)).strftime("%Y-%m-%dT%H:%M:%S")
+        r = requests.get("%s/history/transactions?from=%s" % (ig._base_url, frm), headers=ig._headers(), timeout=10)
+        if r.status_code != 200:
+            return None
+        try:
+            div = float(ig.price_divisor(epic))
+        except Exception:
+            div = 1.0
+        if not div:
+            div = 1.0
+
+        def _f(v):
+            try:
+                return float(str(v).replace(",", ""))
+            except (TypeError, ValueError):
+                return None
+
+        txns = (r.json().get("transactions", []) or [])   # Capital.com returns newest-first
+        fallback = None
+        for t in txns:
+            cl = _f(t.get("closeLevel"))
+            if cl in (None, 0.0):
+                continue
+            true_close = round(cl / div, 6)
+            ol = _f(t.get("openLevel"))
+            if entry_price is not None and ol is not None:
+                true_open = ol / div
+                tol = max(0.5, abs(float(entry_price)) * 0.002)
+                if abs(true_open - float(entry_price)) <= tol:
+                    return true_close                       # exact position match
+            if fallback is None:
+                fallback = true_close                       # newest close for this account as a backstop
+        return fallback
+    except Exception as exc:
+        log.warning("external_close_price(%s) failed: %s -- caller will estimate.", epic, exc)
+        return None
+
+
 def reconcile_orders(ig, epic, hours=24):
     """AUTOMATED order reconciliation: compare our audit log's ACCEPTED opens against Capital.com's
     /history/activity for `epic` over the last `hours`. Returns a list of mismatch strings (empty = clean):
