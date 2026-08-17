@@ -57,6 +57,7 @@ class PaperTraderGold:
             log.info("Using existing trades log: %s", TRADES_LOG)
 
         self.capital_gbp   = STARTING_CAPITAL_GBP
+        self._ensure_account_column()
         self.current_trade: Optional[GoldTrade] = None
         self.trade_history: list[GoldTrade]     = []
         self._gbpusd = DEFAULT_GBPUSD
@@ -155,6 +156,25 @@ class PaperTraderGold:
         except Exception as exc:
             log.warning("Could not restore state (%s) -- starting fresh", exc)
             self._clear_state()
+
+
+    def _ensure_account_column(self) -> None:
+        """Header migration (17 Aug 2026): if an existing trade CSV predates the account column, append
+        `account` to its HEADER so new account-tagged rows read back cleanly (old rows -> blank account,
+        excluded from account-filtered sums). One-line header edit; data rows untouched. Never raises."""
+        try:
+            if not TRADES_LOG.exists():
+                return
+            with open(TRADES_LOG, encoding="utf-8") as f:
+                lines = f.readlines()
+            if not lines or "account" in lines[0]:
+                return
+            lines[0] = lines[0].rstrip() + ",account" + chr(10)
+            with open(TRADES_LOG, "w", encoding="utf-8", newline="") as f:
+                f.writelines(lines)
+            log.info("Migrated trade CSV header: added the account column.")
+        except Exception as exc:
+            log.warning("account-column migration skipped: %s", exc)
 
     def _account_label(self) -> str:
         """DEMO / LIVE -- which real Capital.com account this trade was on (account isolation).
