@@ -19,10 +19,25 @@ SAFETY (fail CLOSED -- any doubt returns None/False so the engine stays FLAT):
 """
 import csv
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
 log = logging.getLogger("LiveExecutor")
+
+
+def _reconciliation_start():
+    """Optional go-live cutoff (RECONCILIATION_START, ISO e.g. 2026-08-16T22:00:00Z). Orders placed BEFORE
+    this are pre-go-live test/manual orders and are ignored by reconciliation, so they never raise a false
+    'mismatch' alert. Unset -> no cutoff (reconcile everything the audit log covers)."""
+    s = (os.getenv("RECONCILIATION_START", "") or "").strip()
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+    except Exception:
+        log.warning("RECONCILIATION_START=%r not ISO YYYY-MM-DDThh:mm:ssZ -- ignoring.", s)
+        return None
 
 # ── Order audit log (go-live prerequisite) ──────────────────────────────────────────────────────
 # Write-only trail of EVERY order interaction (request + outcome), INCLUDING the rejects/skips that the
@@ -266,8 +281,14 @@ def reconcile_orders(ig, epic, hours=24):
         if audit_earliest is None:
             return mismatches   # audit log empty -> nothing to reconcile (don't false-flag pre-audit orders)
         # Only reconcile the period the audit was actually recording (floor at its first entry) so orders
-        # that predate the audit log never show up as false BROKER_ONLY mismatches.
+        # that predate the audit log never show up as false BROKER_ONLY mismatches. Also floor at the optional
+        # RECONCILIATION_START go-live cutoff so pre-go-live test/manual orders (in Capital.com history but not
+        # the audit log) never raise an hourly false 'BROKER_ONLY' alarm.
         eff_cutoff = max(cutoff, audit_earliest)
+        _rs = _reconciliation_start()
+        if _rs is not None:
+            eff_cutoff = max(eff_cutoff, _rs)
+        ours = [t for t in ours if t >= eff_cutoff]     # drop pre-cutoff audit opens too (no false AUDIT_ONLY)
         resp = requests.get("%s/history/activity?from=%s" % (ig._base_url, eff_cutoff.strftime("%Y-%m-%dT%H:%M:%S")),
                             headers=ig._headers(), timeout=12)
         broker = []
