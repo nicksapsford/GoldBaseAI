@@ -180,10 +180,16 @@ def place_order(ig, epic, direction, size, stop_pts, take_profit_pts=None):
 
 def sync_stop(ig, epic, stop_level, tp_level=None):
     """Push the engine's (tightened) stop to Capital.com so the BROKER enforces the locked profit even
-    if the engine dies -- PUT /positions/{dealId} {stopLevel}. Looks up the live position's dealId.
-    Fail-SAFE: on any error/rejection logs a warning and returns False; the engine still enforces the
-    stop via its monitor + close_order, so a failed sync never loses protection, it just isn't
-    broker-mirrored that cycle. Capital.com may reject a stop too close to spot (min distance) -- benign."""
+    if the engine dies -- PUT /positions/{dealId} {stopLevel[, profitLevel]}. Looks up the live position's dealId.
+
+    TP-PRESERVATION FIX (17 Aug 2026): Capital.com's position-update PUT CLEARS any risk order not included in
+    the payload -- so sending {stopLevel} alone WIPED the take-profit set at open time. Every trailing-stop sync
+    therefore stripped the broker TP, leaving a live position with no broker-side take-profit if the engine died.
+    We now re-assert profitLevel in the SAME PUT whenever tp_level is supplied, so the TP survives every stop sync.
+
+    Fail-SAFE: on any error/rejection logs a warning and returns False; the engine still enforces the stop/TP via
+    its monitor + close_order, so a failed sync never loses protection, it just isn't broker-mirrored that cycle.
+    Capital.com may reject a stop too close to spot (min distance) -- benign."""
     if ig is None or stop_level is None:
         return False
     mode = getattr(ig, "account_type", "") or ""
@@ -199,11 +205,18 @@ def sync_stop(ig, epic, stop_level, tp_level=None):
         # On a 100x-scaled live Brent an un-rescaled level would sit 100x below spot -- rejected, or
         # worse, silently accepted as a nonsense stop. No-op on demo (divisor 1).
         _lvl = round(float(ig.to_broker_price(epic, stop_level)), 2)
+        payload = {"stopLevel": _lvl}
+        _tp = None
+        if tp_level is not None:
+            # Re-assert the TP in the SAME PUT so the stop update never wipes the broker take-profit.
+            _tp = round(float(ig.to_broker_price(epic, tp_level)), 2)
+            payload["profitLevel"] = _tp
         r = requests.put("%s/positions/%s" % (ig._base_url, did),
-                         headers=ig._headers(), json={"stopLevel": _lvl}, timeout=8)
+                         headers=ig._headers(), json=payload, timeout=8)
         if r.status_code == 200:
-            log.info("BROKER STOP synced: %s -> %.2f true (%.2f broker) | ID %s",
-                     epic, round(float(stop_level), 2), _lvl, did)
+            log.info("BROKER STOP synced: %s -> stop %.2f (%.2f broker)%s | ID %s",
+                     epic, round(float(stop_level), 2), _lvl,
+                     ("" if _tp is None else " + TP %.2f (%.2f broker)" % (round(float(tp_level), 2), _tp)), did)
             return True
         log.warning("broker stop sync rejected (%s -> %.2f true / %.2f broker): HTTP %s %s",
                     epic, round(float(stop_level), 2), _lvl, r.status_code, r.text[:140])
