@@ -207,7 +207,15 @@ def sync_stop(ig, epic, stop_level, tp_level=None):
         _lvl = round(float(ig.to_broker_price(epic, stop_level)), 2)
         payload = {"stopLevel": _lvl}
         _tp = None
-        if tp_level is not None:
+        # Only send profitLevel when there is a VALID TP price (a real TP is always a positive price).
+        # `if tp_level:` excludes None, 0 and 0.0 -- we NEVER send profitLevel=None or 0 (Capital.com reads
+        # a missing/None/0 profitLevel as "remove the TP"). No valid TP -> the field is simply left out of
+        # the request body, so the TP set at placement is untouched.
+        try:
+            _valid_tp = tp_level is not None and float(tp_level) > 0
+        except (TypeError, ValueError):
+            _valid_tp = False
+        if _valid_tp:
             # Re-assert the TP in the SAME PUT so the stop update never wipes the broker take-profit.
             _tp = round(float(ig.to_broker_price(epic, tp_level)), 2)
             payload["profitLevel"] = _tp
