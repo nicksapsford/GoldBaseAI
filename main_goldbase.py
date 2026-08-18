@@ -33,7 +33,14 @@ import requests
 from dotenv import load_dotenv
 
 from data_feed_gold import GoldDataFeed, GOLD_EPIC, is_market_open, get_liquidity_period
-from capitalcom_connector import CapitalComConnector
+# ── Camelot engine path seam: point the engine at THIS instrument dir + the AlbionBase root
+# (parent) BEFORE importing any camelot_engine module, so .env / logs / trading_mode.json /
+# investment_ledger.csv resolve to exactly the same files as the pre-engine build, whatever the CWD.
+import os as _seam_os
+from pathlib import Path as _seam_Path
+_seam_os.environ.setdefault("ALBION_APP_DIR", str(_seam_Path(__file__).resolve().parent))
+_seam_os.environ.setdefault("ALBION_ROOT", str(_seam_Path(__file__).resolve().parent.parent))
+from camelot_engine.capitalcom_connector import CapitalComConnector
 from notifier_gold import (
     notify_system_startup, notify_trade_opened,
     notify_trade_closed_win, notify_trade_closed_loss, notify_system_error,
@@ -41,12 +48,12 @@ from notifier_gold import (
     notify_kill_switch_triggered,
 )
 from paper_trader_gold import PaperTraderGold, TRADES_LOG, LIVE_EXECUTION as _LIVE_EXECUTION
-import live_executor
-import trading_mode
+from camelot_engine import live_executor
+from camelot_engine import trading_mode
 from pre_checks_gold import run_all_pre_checks, run_individual_pre_checks, check_kill_switch_reset
 from strategy_gold import (should_force_close, get_gbpusd_rate, TIGHT_TRAIL_ACTIVATE_POINTS,
                            NOTIONAL_CAPITAL, RISK_PCT)
-import direction_switch
+from camelot_engine import direction_switch
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -82,96 +89,7 @@ signal.signal(signal.SIGINT, _handle_signal)
 signal.signal(signal.SIGTERM, _handle_signal)
 
 
-def _today_realised_pnl(csv_path, account=None) -> float:
-    """Sum today's (UTC) realised P&L from the trade-log CSV. ACCOUNT ISOLATION (17 Aug 2026): when `account`
-    (DEMO/LIVE) is given, count ONLY that account's trades -- so the live kill switch never inherits demo P&L
-    and vice versa. Legacy rows with no `account` column are EXCLUDED from an account-filtered sum (they
-    predate isolation and must not contaminate either account). Only CLOSED trades are in this CSV.
-    Robust: missing file / no trades / bad rows -> 0.0. All timestamps UTC."""
-    import csv as _csv
-    from datetime import datetime as _dt, timezone as _tz
-    from pathlib import Path as _Path
-    try:
-        p = _Path(csv_path)
-        if not p.exists():
-            return 0.0
-        today = _dt.now(_tz.utc).strftime("%Y-%m-%d")
-        want = account.strip().upper() if account else None
-        total = 0.0
-        with p.open(newline="", encoding="utf-8") as fh:
-            for row in _csv.DictReader(fh):
-                d = (row.get("date") or "").strip()
-                if not d:
-                    d = (row.get("entry_time") or "").strip()[:10]
-                if d != today:
-                    continue
-                if want is not None and (row.get("account") or "").strip().upper() != want:
-                    continue                       # only this account's trades (legacy blank-account rows excluded)
-                try:
-                    total += float(row.get("pnl_gbp") or 0.0)
-                except (TypeError, ValueError):
-                    continue
-        return round(total, 2)
-    except Exception:
-        return 0.0
-
-
-class AccountState:
-    """Live account state passed to the Lancelot pre-checks (kill switch, losses)."""
-
-    def __init__(self, capital: float) -> None:
-        self.capital_gbp = capital
-        self.daily_pnl_gbp = 0.0
-        self.current_day = datetime.now(timezone.utc).date()  # Benchmark daily-reset fix
-        self.consecutive_losses = 0
-        self.last_loss_time = None
-        self.kill_switch_active = False
-        self.kill_switch_tier = 0
-        self.kill_switch_until = None
-        self.kill_switch_reason = ""
-        self.kill_history = []
-
-    def record_trade(self, pnl_gbp: float) -> None:
-        self.daily_pnl_gbp = round(self.daily_pnl_gbp + pnl_gbp, 2)
-        self.capital_gbp = round(self.capital_gbp + pnl_gbp, 2)
-        if pnl_gbp < 0:
-            self.consecutive_losses += 1
-            self.last_loss_time = datetime.now(timezone.utc)
-        else:
-            self.consecutive_losses = 0
-
-    def maybe_reset_daily(self, now_utc) -> bool:
-        """Benchmark daily-reset fix (22 Jul 2026). On a new UTC trading day, clear the
-        daily loss tally and the daily-loss kill switch so yesterday's loss does not carry
-        into today. Previously daily_pnl_gbp was zeroed ONLY at process start, so a prior
-        day's loss permanently re-triggered the kill switch until a manual restart."""
-        today = now_utc.date()
-        if today == self.current_day:
-            return False
-        self.current_day = today
-        self.daily_pnl_gbp = 0.0
-        self.consecutive_losses = 0
-        self.kill_switch_active = False
-        self.kill_switch_tier = 0
-        self.kill_switch_until = None
-        self.kill_switch_reason = ""
-        log.info("New UTC trading day %s -- daily P&L + kill switch reset.", today)
-        return True
-
-    def reset_for_account_switch(self, account_label, csv_path) -> None:
-        """ACCOUNT ISOLATION (17 Aug 2026). On a DEMO<->LIVE switch the two accounts must NOT share state --
-        a demo loss must never block live (cooldown/consec) or trip the live kill switch, and vice versa.
-        Clear cooldown / consecutive-loss / daily-loss-kill state, then reseed today's realised P&L from THIS
-        account's trades only. Each account starts clean."""
-        self.consecutive_losses = 0
-        self.last_loss_time = None
-        self.kill_switch_active = False
-        self.kill_switch_tier = 0
-        self.kill_switch_until = None
-        self.kill_switch_reason = ""
-        self.daily_pnl_gbp = _today_realised_pnl(csv_path, account=account_label)
-        log.warning("ACCOUNT ISOLATION: state reset for %s -- cooldown/consec/kill cleared; today P&L reseeded "
-                    "to GBP %.2f from %s trades only.", account_label, self.daily_pnl_gbp, account_label)
+from camelot_engine.account_state import AccountState, _today_realised_pnl
 
 
 # ── SSL 3-timeframe agreement (the benchmark's direction signal) ──────────────
@@ -533,7 +451,7 @@ def _sync_account(ig, stanley, account=None):
     ACCOUNT ISOLATION (17 Aug 2026): on a successful switch, reset AccountState so the new account starts
     clean (no inherited cooldown / consecutive-loss / daily-loss-kill from the other account)."""
     try:
-        import trading_mode
+        from camelot_engine import trading_mode
         desired = trading_mode.read_mode()
         if ig is None or desired == ig.account_type:
             return

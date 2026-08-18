@@ -14,8 +14,15 @@ from pathlib import Path
 
 from flask import Flask, jsonify, request
 
-import direction_switch
-import trading_mode
+# ── Camelot engine path seam: point the engine at THIS instrument dir + the AlbionBase root
+# (parent) BEFORE importing any camelot_engine module, so .env / logs / trading_mode.json /
+# investment_ledger.csv resolve to exactly the same files as the pre-engine build, whatever the CWD.
+import os as _seam_os
+from pathlib import Path as _seam_Path
+_seam_os.environ.setdefault("ALBION_APP_DIR", str(_seam_Path(__file__).resolve().parent))
+_seam_os.environ.setdefault("ALBION_ROOT", str(_seam_Path(__file__).resolve().parent.parent))
+from camelot_engine import direction_switch
+from camelot_engine import trading_mode
 
 BASE_DIR = Path(__file__).resolve().parent
 LOG_DIR = BASE_DIR / "logs"

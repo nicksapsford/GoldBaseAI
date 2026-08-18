@@ -21,9 +21,9 @@ if _ENV_PATH.exists():
 else:
     load_dotenv()
 
-import trading_mode                     # [DEMO]/[LIVE] marker source
+from camelot_engine import trading_mode                     # [DEMO]/[LIVE] marker source
 try:
-    import ledger                       # Pot + true Trading P&L (balance - net invested)
+    from camelot_engine import ledger                       # Pot + true Trading P&L (balance - net invested)
 except Exception:
     ledger = None
 

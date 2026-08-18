@@ -15,8 +15,8 @@ from typing import Optional
 import pandas as pd
 
 from strategy_gold import GoldTrade, TRAILING_STOP_POINTS, DEFAULT_GBPUSD, TAKE_PROFIT_POINTS
-from live_executor import place_order, close_order, existing_position, sync_stop
-import trading_mode
+from camelot_engine.live_executor import place_order, close_order, existing_position, sync_stop
+from camelot_engine import trading_mode
 
 log = logging.getLogger("GoldTrader.Stanley")
 
