@@ -56,6 +56,7 @@ VERSION = _VER.read_text().strip() if _VER.exists() else "1.0.0"
 LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 SHUTDOWN_FLAG = LOG_DIR / "shutdown.flag"
+RECON_STATE_FILE = LOG_DIR / "reconcile_state.json"
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s  %(levelname)-7s %(message)s",
@@ -643,10 +644,15 @@ def main() -> None:
                 last_order_recon = now
                 try:
                     _mm = live_executor.reconcile_orders(ig, GOLD_EPIC, hours=24)
-                    if _mm:
+                    _gate = live_executor.reconcile_alert_gate(_mm, RECON_STATE_FILE)
+                    if _gate == "push":
                         for _m in _mm:
                             log.error("ORDER RECONCILE MISMATCH: %s", _m)
                         notify_system_error("GoldBase order reconcile: %d mismatch(es) vs Capital.com -- check logs/order_audit.csv." % len(_mm))
+                    elif _gate == "suppress":
+                        log.info("Order reconcile: %d KNOWN mismatch(es) still present -- suppressed (already alerted): %s", len(_mm), _mm)
+                    elif _gate == "resolved":
+                        log.info("Order reconcile: previously-flagged mismatch(es) now RESOLVED -- clean.")
                     else:
                         log.info("Order reconcile OK -- audit log matches Capital.com.")
                 except Exception as _e:

@@ -336,7 +336,7 @@ def reconcile_orders(ig, epic, hours=24):
     try:
         import requests
         cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-        ours, audit_earliest = [], None
+        ours_open, ours_all, audit_earliest = [], [], None
         if _AUDIT_FILE.exists():
             with open(_AUDIT_FILE, newline="", encoding="utf-8") as f:
                 for r in csv.DictReader(f):
@@ -346,19 +346,21 @@ def reconcile_orders(ig, epic, hours=24):
                         continue
                     if audit_earliest is None or t < audit_earliest:
                         audit_earliest = t
-                    if r.get("epic") == epic and r.get("action") == "OPEN" and r.get("outcome") == "ACCEPTED" and t >= cutoff:
-                        ours.append(t)
+                    if r.get("epic") != epic or r.get("outcome") != "ACCEPTED" or t < cutoff:
+                        continue
+                    act = r.get("action")
+                    if act == "OPEN":
+                        ours_open.append(t); ours_all.append(t)
+                    elif act == "CLOSE":
+                        ours_all.append(t)          # closes count too, so a broker CLOSE is not a false BROKER_ONLY
         if audit_earliest is None:
-            return mismatches   # audit log empty -> nothing to reconcile (don't false-flag pre-audit orders)
-        # Only reconcile the period the audit was actually recording (floor at its first entry) so orders
-        # that predate the audit log never show up as false BROKER_ONLY mismatches. Also floor at the optional
-        # RECONCILIATION_START go-live cutoff so pre-go-live test/manual orders (in Capital.com history but not
-        # the audit log) never raise an hourly false 'BROKER_ONLY' alarm.
+            return mismatches   # audit log empty -> nothing to reconcile (do not false-flag pre-audit orders)
         eff_cutoff = max(cutoff, audit_earliest)
         _rs = _reconciliation_start()
         if _rs is not None:
             eff_cutoff = max(eff_cutoff, _rs)
-        ours = [t for t in ours if t >= eff_cutoff]     # drop pre-cutoff audit opens too (no false AUDIT_ONLY)
+        ours_open = [t for t in ours_open if t >= eff_cutoff]
+        ours_all  = [t for t in ours_all  if t >= eff_cutoff]
         resp = requests.get("%s/history/activity?from=%s" % (ig._base_url, eff_cutoff.strftime("%Y-%m-%dT%H:%M:%S")),
                             headers=ig._headers(), timeout=12)
         broker = []
@@ -373,21 +375,45 @@ def reconcile_orders(ig, epic, hours=24):
             log.warning("reconcile_orders(%s): activity query HTTP %s -- skipping this run.", epic, resp.status_code)
             return mismatches
         WIN = 120.0
-        bmatched = [False] * len(broker)
-        for t in ours:
-            hit = False
-            for i, bt in enumerate(broker):
-                if not bmatched[i] and abs((t - bt).total_seconds()) <= WIN:
-                    bmatched[i] = True
-                    hit = True
-                    break
-            if not hit:
+        for t in ours_open:
+            if not any(abs((t - bt).total_seconds()) <= WIN for bt in broker):
                 mismatches.append("AUDIT_ONLY: recorded ACCEPTED %s open at %sZ has NO Capital.com POSITION ACCEPTED"
                                   % (epic, t.strftime("%Y-%m-%dT%H:%M:%S")))
-        for i, bt in enumerate(broker):
-            if not bmatched[i]:
-                mismatches.append("BROKER_ONLY: Capital.com opened %s at %sZ with NO audit-log ACCEPTED row"
+        for bt in broker:
+            if not any(abs((bt - t).total_seconds()) <= WIN for t in ours_all):
+                mismatches.append("BROKER_ONLY: Capital.com %s position event at %sZ with NO audit-log OPEN/CLOSE row"
                                   % (epic, bt.strftime("%Y-%m-%dT%H:%M:%S")))
     except Exception as exc:
         log.warning("reconcile_orders(%s) failed: %s", epic, exc)
     return mismatches
+
+
+def reconcile_alert_gate(mismatches, state_path):
+    """De-dup gate for the hourly reconcile alert so a persisting, already-known, non-actionable mismatch does
+    not push to Nick every cycle. Returns 'push' (new/changed set, incl a count increase), 'suppress' (same set
+    as last run -> log only), 'resolved' (had mismatches, now clean -> log only), or 'clean'. Signature = md5 of
+    the sorted mismatch strings, persisted in state_path (survives restarts). Never raises -> falls back to 'push'
+    so a real problem is never swallowed."""
+    import hashlib, json as _json
+    try:
+        sig = hashlib.md5("|".join(sorted(mismatches)).encode("utf-8")).hexdigest() if mismatches else ""
+        prev = ""
+        try:
+            prev = (_json.loads(Path(state_path).read_text(encoding="utf-8")) or {}).get("sig", "")
+        except Exception:
+            prev = ""
+        try:
+            Path(state_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(state_path).write_text(_json.dumps({
+                "sig": sig, "count": len(mismatches),
+                "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "mismatches": list(mismatches)[:20],
+            }), encoding="utf-8")
+        except Exception:
+            pass
+        if not mismatches:
+            return "resolved" if prev else "clean"
+        return "push" if sig != prev else "suppress"
+    except Exception as exc:
+        log.warning("reconcile_alert_gate failed (%s) -- defaulting to push", exc)
+        return "push"
