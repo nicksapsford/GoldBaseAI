@@ -6,3 +6,6 @@ numpy
 requests
 yfinance
 pytz
+
+# Camelot shared engine (Step 2 -- pinned)
+camelot-engine @ git+https://github.com/nicksapsford/CamelotEngineAI.git@v1.1.0

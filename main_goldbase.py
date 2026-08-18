@@ -49,6 +49,7 @@ from notifier_gold import (
 )
 from paper_trader_gold import PaperTraderGold, TRADES_LOG, LIVE_EXECUTION as _LIVE_EXECUTION
 from camelot_engine import live_executor
+from camelot_engine import reconciliation
 from camelot_engine import trading_mode
 from pre_checks_gold import run_all_pre_checks, run_individual_pre_checks, check_kill_switch_reset
 from strategy_gold import (should_force_close, get_gbpusd_rate, TIGHT_TRAIL_ACTIVATE_POINTS,
@@ -154,7 +155,7 @@ def _on_close(stanley, account, price, reason):
             _dur = (datetime.now(timezone.utc) - trade.entry_time).total_seconds()
     except Exception:
         _dur = None
-    _pot = _bal_cache.get("balance")   # last-known real Capital.com balance (cached, no extra call)
+    _pot = reconciliation.last_balance()   # last-known real Capital.com balance (cached, no extra call)
     try:
         if trade.pnl_gbp >= 0:
             notify_trade_closed_win(trade.direction, price, trade.points_gained,
@@ -202,55 +203,8 @@ def _maybe_notify_kill_switch(account) -> None:
         _kill_notified = False
 
 
-# ── Periodic position reconciliation (Part 2, 11 Aug 2026) ──────────────────────────────────────
-# While in a LIVE trade, verify (throttled ~60s) that the position still exists on Capital.com. If it
-# was closed EXTERNALLY (margin liquidation, manual close on the app, network) before our own stop
-# fired, book it as EXTERNAL_CLOSE (real P&L from the balance delta), return FLAT, and alert Nick.
-# FAIL-SAFE: NEVER flatten on an uncertain API response -- only on a CONFIRMED "not found".
-_recon = {"fails": 0, "last_ts": 0.0}
-
-
-def _reconcile_external_close(stanley, account, ig, price, gbpusd) -> bool:
-    if not (_LIVE_EXECUTION and ig is not None and stanley.in_trade):
-        return False
-    if not getattr(stanley.current_trade, "deal_id", None):
-        return False
-    now = time.time()
-    if now - _recon["last_ts"] < 60:          # throttle (brief cadence: <= every poll cycle / 5 min)
-        return False
-    _recon["last_ts"] = now
-    pos = live_executor.existing_position(ig, GOLD_EPIC)
-    if pos == "UNKNOWN":                       # API failure -> NEVER flatten on uncertain
-        _recon["fails"] += 1
-        log.warning("reconcile: could not verify GOLD position (%d consecutive failures)", _recon["fails"])
-        if _recon["fails"] == 3:
-            try:
-                notify_system_error("GoldBase: 3 consecutive position-reconcile failures -- check Capital.com/network.")
-            except Exception:
-                pass
-        return False
-    _recon["fails"] = 0
-    if pos is None:                            # CONFIRMED closed externally
-        deal_id = getattr(stanley.current_trade, "deal_id", None)
-        # P&L ACCURACY (17 Aug 2026): read the ACTUAL close fill from Capital.com history rather than
-        # estimating the exit from the last price feed, so the CSV matches the broker. Fail-safe: fall back
-        # to the estimate if history is unavailable.
-        _entry = getattr(stanley.current_trade, "entry_price", None)
-        _real = live_executor.external_close_price(ig, GOLD_EPIC, entry_price=_entry)
-        _exit_px = _real if _real is not None else price
-        log.warning("EXTERNAL CLOSE detected: GOLD position gone on Capital.com (deal %s) -- booking at %s%s + FLAT.",
-                    deal_id, _exit_px, "" if _real is not None else " (ESTIMATED -- history unavailable)")
-        trade = stanley.close_trade(_exit_px, "EXTERNAL_CLOSE", gbpusd)
-        if trade is not None:
-            account.record_trade(trade.pnl_gbp)
-        try:
-            notify_external_close(trade.direction if trade else "?",
-                                  trade.pnl_gbp if trade else 0.0,
-                                  reason="unknown", pot=_bal_cache.get("balance"))
-        except Exception:
-            pass
-        return True
-    return False
+# ── Position reconciliation + balance/market caches now live in camelot_engine.reconciliation
+# (Step 2c). main wires GoldBase's epic / session schedule / notifier callbacks into them.
 
 
 def monitor(feed, stanley, account, ig, now_utc):
@@ -260,7 +214,10 @@ def monitor(feed, stanley, account, ig, now_utc):
     if price is None:
         return
     gbpusd = get_gbpusd_rate(ig)
-    if _reconcile_external_close(stanley, account, ig, price, gbpusd):
+    if reconciliation.reconcile_external_close(stanley, account, ig, price, gbpusd, epic=GOLD_EPIC,
+                                               live_execution=_LIVE_EXECUTION, system_name="GoldBase",
+                                               notify_error=notify_system_error,
+                                               notify_external=notify_external_close):
         return   # position closed externally -- booked as EXTERNAL_CLOSE, now FLAT
     if should_force_close(now_utc):
         stanley.close_trade(price, "FORCE_CLOSE_2045", gbpusd)
@@ -331,62 +288,11 @@ def run_candle_tick(feed, stanley, account, ig):
 
 # ── Dashboard push ────────────────────────────────────────────────────────────
 
-# ── Account balance (Part 3, READ-ONLY) ───────────────────────────────────────
-# TOTAL POT = the real Capital.com account balance (demo now, live later). Cached 60s so we never
-# hammer the /accounts endpoint. NEVER places an order -- pure read. 2% of it = risk budget per trade.
-_bal_cache = {"ts": 0.0, "balance": None, "acc_type": None}
-
-
-def get_account_pot(ig):
-    """Return (balance_or_None, acc_type). Cached 60s PER ACCOUNT; keeps last-good on a transient
-    API failure.
-
-    Part 1 (13 Aug 2026): the cache used to be keyed on TIME ONLY, while acc_type was read live. So
-    for up to 60 seconds after Nick flipped the DEMO/LIVE switch the dashboard paired the NEW account
-    label with the OLD account's balance -- e.g. a red LIVE banner over the £11,000 demo pot. The
-    cache is now invalidated the moment the account changes, and the stale figure is dropped
-    immediately so the other _bal_cache readers (the Percival 'pot' in the close notifications)
-    cannot serve it either."""
-    acc_type = ig.account_type if ig is not None else "DEMO"
-    now = time.time()
-    if _bal_cache.get("acc_type") != acc_type:
-        _bal_cache.update(ts=0.0, balance=None, acc_type=acc_type)
-    if _bal_cache["balance"] is not None and (now - _bal_cache["ts"]) < 60:
-        return _bal_cache["balance"], acc_type
-    bal = None
-    try:
-        if ig is not None:
-            if not ig.connected:
-                ig.connect()          # self-heal a failed startup connect (engine may be on yfinance fallback)
-            if ig.connected:
-                bal = ig.get_account_balance()
-    except Exception:
-        bal = None
-    if bal is not None:
-        _bal_cache.update(ts=now, balance=bal, acc_type=acc_type)
-    return _bal_cache["balance"], acc_type
-
-
 # ── Market status for the dashboard dot (Part 4d) ─────────────────────────────
 # in_session = the trading schedule (is_market_open, no API). tradeable = Capital.com marketStatus,
 # cached 60s so the dot never hammers /markets. Dot: green = in session + tradeable; amber = in session
 # but Capital temporarily closed (e.g. daily break); red = out of session. Hours are display-only.
 SESSION_HOURS = "22:00–20:45 UTC"
-_mkt_cache = {"ts": 0.0, "tradeable": None}
-
-
-def get_market_status(ig, now_utc):
-    in_sess = is_market_open(now_utc)
-    now = time.time()
-    if _mkt_cache["tradeable"] is None or (now - _mkt_cache["ts"]) >= 60:
-        try:
-            if ig is not None and ig.connected:
-                _mkt_cache.update(ts=now, tradeable=bool(live_executor.market_tradeable(ig, GOLD_EPIC)))
-        except Exception:
-            pass
-    return {"in_session": in_sess, "tradeable": _mkt_cache["tradeable"], "hours": SESSION_HOURS}
-
-
 def push_dashboard(stanley, account, mode, ig=None):
     trade = stanley.current_trade
     price = _last.get("price")
@@ -413,7 +319,7 @@ def push_dashboard(stanley, account, mode, ig=None):
                "stake": round(trade.stake, 2), "floating_gbp": floating,
                "ladder_step": getattr(trade, "ladder_step", 0), "locked_gbp": locked}
     lanc = "IN TRADE" if stanley.in_trade else _last.get("lancelot", "--")
-    pot, acc_type = get_account_pot(ig)
+    pot, acc_type = reconciliation.account_pot(ig)
     # Part 1 (13 Aug 2026): risk per trade is RISK_PCT of the FIXED NOTIONAL_CAPITAL (£60 on £3,000),
     # matching how the trade is actually sized. It used to be 2% of the real account balance, which
     # showed £220 against the £11,000 demo pot -- sizing never uses the real balance.
@@ -423,7 +329,7 @@ def push_dashboard(stanley, account, mode, ig=None):
         "account_balance": pot, "account_type": acc_type,
         "risk_per_trade": risk, "total_pot": pot,
         "mode": mode, "session": _last.get("session", "--"),
-        "market": get_market_status(ig, datetime.now(timezone.utc)),
+        "market": reconciliation.market_status(ig, datetime.now(timezone.utc), GOLD_EPIC, is_market_open, SESSION_HOURS),
         "updated_utc": datetime.now(timezone.utc).strftime("%H:%M:%S"),
         "price": round(price, 2) if price is not None else None,
         "in_trade": stanley.in_trade, "position": pos,

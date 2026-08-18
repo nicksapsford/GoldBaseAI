@@ -23,6 +23,7 @@ _seam_os.environ.setdefault("ALBION_APP_DIR", str(_seam_Path(__file__).resolve()
 _seam_os.environ.setdefault("ALBION_ROOT", str(_seam_Path(__file__).resolve().parent.parent))
 from camelot_engine import direction_switch
 from camelot_engine import trading_mode
+from camelot_engine import dashboard as _dash
 
 BASE_DIR = Path(__file__).resolve().parent
 LOG_DIR = BASE_DIR / "logs"
@@ -48,8 +49,6 @@ PORT = 5033
 logging.basicConfig(level=logging.WARNING)
 logging.Formatter.converter = time.gmtime
 log = logging.getLogger("dashboard")
-app = Flask(__name__)
-_state = {"system": "GoldBase", "version": APP_VERSION}
 
 
 HTML = """<!DOCTYPE html>
@@ -204,74 +203,11 @@ def _read_trades(path, limit=300):
     return rows[-limit:][::-1]
 
 
-@app.route("/")
-def index():
-    return HTML.replace("__VER__", "v" + APP_VERSION).replace("__ENV__", _ENV_BADGE)
-
-
-@app.route("/api/update", methods=["POST"])
-def api_update():
-    try:
-        _state.update(request.get_json(force=True, silent=True) or {})
-        _state["received_utc"] = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        return jsonify({"ok": True})
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
-
-
-@app.route("/api/state")
-def api_state():
-    d = dict(_state)
-    try:
-        d["trading_mode"] = trading_mode.read_mode()
-        d["live_configured"] = trading_mode.has_live_credentials()   # LIVE switch gated on this
-        d["cum_pnl"] = trading_mode.cum_pnl_since_epoch(TRADES_CSV)   # Part 4c: real orders only
-        d["pnl_start"] = trading_mode.PNL_START_DATE
-    except Exception:
-        d["trading_mode"] = "DEMO"
-        d["live_configured"] = False
-    return jsonify(d)
-
-
-@app.route("/api/direction", methods=["GET", "POST"])
-def api_direction():
-    if request.method == "GET":
-        return jsonify(direction_switch.get_state())
-    try:
-        body = request.get_json(force=True, silent=True) or {}
-        by = str(body.get("by") or "Nick").strip() or "Nick"
-        return jsonify(direction_switch.set_mode(body.get("mode"), set_by=by))
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 400
-
-
-@app.route("/api/trades")
-def api_trades():
-    return jsonify({"trades": _read_trades(TRADES_CSV)})
-
-
-@app.route("/api/shutdown", methods=["POST"])
-def api_shutdown():
-    """Write the shutdown flag for the engine + watchdog, then kill this dashboard.
-    Used by the BenchmarkRoundTable SHUTDOWN ALL fan-out (POST /api/shutdown)."""
-    try:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        SHUTDOWN_FLAG.write_text("shutdown requested\n", encoding="utf-8")
-        log.info("Shutdown flag written -- engine will exit on next check")
-    except Exception as e:
-        log.warning("Could not write shutdown flag: %s", e)
-
-    def _kill():
-        time.sleep(0.5)
-        os.kill(os.getpid(), signal.SIGTERM)
-    threading.Thread(target=_kill, daemon=True).start()
-    return jsonify({"status": "shutting_down"})
-
-
-@app.route("/api/health")
-def api_health():
-    return jsonify({"status": "ok", "system": "GoldBase",
-                    "time": datetime.now(timezone.utc).isoformat()})
+app, _state = _dash.create_app(
+    system_name="GoldBase", version=APP_VERSION, html=HTML, env_badge=_ENV_BADGE,
+    trades_csv=TRADES_CSV, trades_reader=_read_trades,
+    shutdown_flag=SHUTDOWN_FLAG, log_dir=LOG_DIR, direction_switch=direction_switch,
+)
 
 
 if __name__ == "__main__":

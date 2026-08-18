@@ -1,16 +1,15 @@
 """
 GoldBase A.I. -- notifier_gold.py  (Percival)
 ================================================================================
-AlbionBase push notifications via Pushover. EVERY notification is marked [DEMO] or [LIVE] from
-trading_mode.json (Part 4a) so Nick always knows which Capital.com account is affected. Priorities
-follow the 12 Aug 2026 brief (Part 4d): a LIVE event is always louder than the equivalent DEMO event.
-Gated by LIVE_NOTIFICATIONS -- only AlbionBase is enabled; every other desk stays silent.
+GoldBase's Pushover MESSAGE BUILDERS. The GATE -- the LIVE_NOTIFICATIONS + LIVE-only
+standing rule, [DEMO]/[LIVE] prefix, Pushover POST, priority + formatting helpers --
+now lives ONCE in camelot_engine.notifications. This file only builds GoldBase's
+per-event text and calls send(). Silent unless LIVE (K1 live box), enforced in the gate.
 """
 import logging
 import os
 from pathlib import Path
 
-import requests
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -21,102 +20,18 @@ if _ENV_PATH.exists():
 else:
     load_dotenv()
 
-from camelot_engine import trading_mode                     # [DEMO]/[LIVE] marker source
-try:
-    from camelot_engine import ledger                       # Pot + true Trading P&L (balance - net invested)
-except Exception:
-    ledger = None
+from camelot_engine.notifications import (
+    send as _send, prio as _prio, m as _m,
+    px as _px, money as _money, dur as _dur, pot_line as _pot_line,
+    P_LOW as _P_LOW, P_NORMAL as _P_NORMAL, P_HIGH as _P_HIGH, P_EMERGENCY as _P_EMERGENCY,
+)
 
 log = logging.getLogger("GoldBase.Percival")
 
-_PUSHOVER_API = "https://api.pushover.net/1/messages.json"
-_USER  = os.getenv("PUSHOVER_USER_KEY",  "")
-_TOKEN = os.getenv("PUSHOVER_API_TOKEN", "")
-_LIVE_NOTIFICATIONS = os.getenv("LIVE_NOTIFICATIONS", "False").strip().lower() in ("1", "true", "yes", "on")
 _NOTIONAL = os.getenv("NOTIONAL_CAPITAL", "3000")
 
 # ── Per-instrument ────────────────────────────────────────────────────────────
 SYS = "GoldBase"
-
-
-def _px(p):
-    try:
-        return "$%s" % format(float(p), ",.2f")
-    except Exception:
-        return str(p)
-
-
-# Pushover priority: -1 low, 0 normal, 1 high, 2 emergency (retry until acknowledged).
-_P_LOW, _P_NORMAL, _P_HIGH, _P_EMERGENCY = -1, 0, 1, 2
-
-
-def _m():
-    try:
-        return trading_mode.read_mode()
-    except Exception:
-        return "DEMO"
-
-
-def _prio(demo, live):
-    """LIVE events are always at least as loud as the DEMO equivalent (Part 4d)."""
-    return live if _m() == "LIVE" else demo
-
-
-def _money(v):
-    try:
-        v = float(v)
-        return ("+£%.2f" % v) if v >= 0 else ("-£%.2f" % abs(v))
-    except Exception:
-        return str(v)
-
-
-def _dur(d):
-    if d is None:
-        return ""
-    if isinstance(d, str):
-        return d
-    try:
-        s = int(d); h = s // 3600; m = (s % 3600) // 60
-        return ("%dh %dm" % (h, m)) if h else ("%dm" % m)
-    except Exception:
-        return ""
-
-
-def _pot_line(pot):
-    """'\\nPot: £X | Trading P&L: +£Y' -- omitted if the pot isn't known."""
-    if pot is None:
-        return ""
-    try:
-        pot = float(pot)
-        tp = ledger.trading_pnl(pot) if ledger else None
-        tps = (" | Trading P&L: %s" % _money(tp)) if tp is not None else ""
-        return "\nPot: £%s%s" % (format(pot, ",.2f"), tps)
-    except Exception:
-        return ""
-
-
-def _send(title: str, message: str, priority: int = _P_NORMAL) -> None:
-    """Post a Pushover notification, title auto-prefixed [DEMO]/[LIVE]. Silent unless LIVE_NOTIFICATIONS."""
-    if not _LIVE_NOTIFICATIONS:
-        log.debug("LIVE_NOTIFICATIONS off -- suppressed: %s", title)
-        return
-    if _m() != "LIVE":                    # STANDING RULE: Pushover ONLY in LIVE mode (K1 live box); DEMO = log-only
-        log.debug("trading_mode DEMO -- Pushover suppressed (log only): %s", title)
-        return
-    if not _USER or not _TOKEN:
-        log.debug("Pushover not configured -- skipping: %s", title)
-        return
-    full = "[%s] %s" % (_m(), title)
-    data = {"token": _TOKEN, "user": _USER, "title": full, "message": message, "priority": priority}
-    if priority >= _P_EMERGENCY:          # emergency must retry + expire
-        data["retry"] = 60
-        data["expire"] = 3600
-    try:
-        r = requests.post(_PUSHOVER_API, data=data, timeout=5)
-        if r.status_code != 200:
-            log.warning("Pushover HTTP %s for: %s", r.status_code, full)
-    except Exception as exc:
-        log.warning("Pushover notification failed (%s): %s", full, exc)
 
 
 # ── Trading notifications (Part 1) ────────────────────────────────────────────
