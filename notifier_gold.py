@@ -239,3 +239,9 @@ def notify_system_error(error_msg) -> None:
 
 def notify_event_block(reason) -> None:
     _send("%s — event block" % SYS, "High-impact event: %s. New entries paused." % reason, _P_LOW)
+
+
+def notify_reconcile_clear() -> None:
+    """One-shot confirmation that a previously-flagged order-reconcile mismatch has now cleared (18 Aug 2026).
+    Low priority -- good news / FYI, not an action item. Pairs with live_executor.reconcile_alert_gate 'resolved'."""
+    _send("%s -- reconcile clear" % SYS, "Order audit matches Capital.com again -- the earlier mismatch has cleared.", _P_LOW)

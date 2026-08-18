@@ -38,7 +38,7 @@ from notifier_gold import (
     notify_system_startup, notify_trade_opened,
     notify_trade_closed_win, notify_trade_closed_loss, notify_system_error,
     notify_two_speed_activated, notify_external_close, notify_margin_rejection,
-    notify_kill_switch_triggered,
+    notify_kill_switch_triggered, notify_reconcile_clear,
 )
 from paper_trader_gold import PaperTraderGold, TRADES_LOG, LIVE_EXECUTION as _LIVE_EXECUTION
 import live_executor
@@ -653,6 +653,10 @@ def main() -> None:
                         log.info("Order reconcile: %d KNOWN mismatch(es) still present -- suppressed (already alerted): %s", len(_mm), _mm)
                     elif _gate == "resolved":
                         log.info("Order reconcile: previously-flagged mismatch(es) now RESOLVED -- clean.")
+                        try:
+                            notify_reconcile_clear()
+                        except Exception:
+                            pass
                     else:
                         log.info("Order reconcile OK -- audit log matches Capital.com.")
                 except Exception as _e:
