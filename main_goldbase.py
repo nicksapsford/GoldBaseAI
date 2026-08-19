@@ -65,6 +65,7 @@ LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 SHUTDOWN_FLAG = LOG_DIR / "shutdown.flag"
 RECON_STATE_FILE = LOG_DIR / "reconcile_state.json"
+DE_STATE_FILE = LOG_DIR / "double_entry_state.json"
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s  %(levelname)-7s %(message)s",
@@ -128,12 +129,23 @@ _last = {"price": None, "signal": None, "lancelot": "awaiting first tick",
 def _open(stanley, ig, direction, price, period, gbpusd):
     trade = stanley.open_trade(direction, price, gbpusd, period)
     if trade is None:
-        # STAGE B: the real demo order was refused/failed -> stay FLAT, alert, do NOT retry.
-        try:
-            notify_margin_rejection("Order rejected -- see logs/order_audit.csv")
-        except Exception:
-            pass
-        log.error("OPEN FAILED: real demo order not placed -- remaining FLAT.")
+        _lo = getattr(live_executor, "LAST_OPEN", {}) or {}
+        if _lo.get("reason") == "double-entry":
+            _g = live_executor.double_entry_gate(_lo.get("block_deal_id"), DE_STATE_FILE)
+            log.error("OPEN blocked: a position is already open at Capital.com (double-entry, deal %s) -- engine FLAT "
+                      "but broker isn't [state desync; alert=%s].", _lo.get("block_deal_id"), _g)
+            if _g == "push":
+                try:
+                    notify_margin_rejection("GoldBase: a position is already open at Capital.com (no double-entry). Engine is "
+                                            "FLAT but the broker is not -- state desync; check.")
+                except Exception:
+                    pass
+        else:
+            try:
+                notify_margin_rejection("Order rejected -- see logs/order_audit.csv")
+            except Exception:
+                pass
+            log.error("OPEN FAILED: real order not placed -- remaining FLAT.")
         return
     try:
         notify_trade_opened(direction=direction, entry_price=price, stop_loss=trade.stop_loss,
