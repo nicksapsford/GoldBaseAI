@@ -57,6 +57,7 @@ LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 SHUTDOWN_FLAG = LOG_DIR / "shutdown.flag"
 RECON_STATE_FILE = LOG_DIR / "reconcile_state.json"
+DE_STATE_FILE = LOG_DIR / "double_entry_state.json"
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s  %(levelname)-7s %(message)s",
@@ -209,12 +210,26 @@ _last = {"price": None, "signal": None, "lancelot": "awaiting first tick",
 def _open(stanley, ig, direction, price, period, gbpusd):
     trade = stanley.open_trade(direction, price, gbpusd, period)
     if trade is None:
-        # STAGE B: the real demo order was refused/failed -> stay FLAT, alert, do NOT retry.
-        try:
-            notify_margin_rejection("Order rejected -- see logs/order_audit.csv")
-        except Exception:
-            pass
-        log.error("OPEN FAILED: real demo order not placed -- remaining FLAT.")
+        # STAGE B: the real demo order was refused/failed -> stay FLAT, do NOT retry. De-dup the double-entry alert:
+        # if a broker position blocks entry (engine FLAT but broker isn't), push once per blocking position, not every
+        # attempt. Other rejections (margin etc.) alert as before.
+        _lo = getattr(live_executor, "LAST_OPEN", {}) or {}
+        if _lo.get("reason") == "double-entry":
+            _g = live_executor.double_entry_gate(_lo.get("block_deal_id"), DE_STATE_FILE)
+            log.error("OPEN blocked: a position is already open at Capital.com (double-entry, deal %s) -- engine FLAT "
+                      "but broker isn't [state desync; alert=%s].", _lo.get("block_deal_id"), _g)
+            if _g == "push":
+                try:
+                    notify_margin_rejection("GoldBase: a position is already open at Capital.com (no double-entry). "
+                                            "Engine is FLAT but the broker is not -- state desync; check.")
+                except Exception:
+                    pass
+        else:
+            try:
+                notify_margin_rejection("Order rejected -- see logs/order_audit.csv")
+            except Exception:
+                pass
+            log.error("OPEN FAILED: real demo order not placed -- remaining FLAT.")
         return
     try:
         notify_trade_opened(direction=direction, entry_price=price, stop_loss=trade.stop_loss,
@@ -222,6 +237,10 @@ def _open(stanley, ig, direction, price, period, gbpusd):
                             liquidity_period=period, size_oz=trade.size_oz)
     except Exception as exc:
         log.warning("Percival open notify failed: %s", exc)
+    try:
+        live_executor.double_entry_gate(None, DE_STATE_FILE)   # a real open succeeded -> clear any double-entry alert state
+    except Exception:
+        pass
     log.info("OPEN %s @ $%.2f | stop=$%.2f target=$%.2f stake=£%.2f/pt",
              direction, price, trade.stop_loss, trade.take_profit, trade.stake)
 
@@ -290,7 +309,7 @@ def _maybe_notify_kill_switch(account) -> None:
 # was closed EXTERNALLY (margin liquidation, manual close on the app, network) before our own stop
 # fired, book it as EXTERNAL_CLOSE (real P&L from the balance delta), return FLAT, and alert Nick.
 # FAIL-SAFE: NEVER flatten on an uncertain API response -- only on a CONFIRMED "not found".
-_recon = {"fails": 0, "last_ts": 0.0}
+_recon = {"fails": 0, "last_ts": 0.0, "none_streak": 0}
 
 
 def _reconcile_external_close(stanley, account, ig, price, gbpusd) -> bool:
@@ -305,6 +324,7 @@ def _reconcile_external_close(stanley, account, ig, price, gbpusd) -> bool:
     pos = live_executor.existing_position(ig, GOLD_EPIC)
     if pos == "UNKNOWN":                       # API failure -> NEVER flatten on uncertain
         _recon["fails"] += 1
+        _recon["none_streak"] = 0                 # an uncertain read breaks the confirmed-none streak
         log.warning("reconcile: could not verify GOLD position (%d consecutive failures)", _recon["fails"])
         if _recon["fails"] == 3:
             try:
@@ -313,17 +333,26 @@ def _reconcile_external_close(stanley, account, ig, price, gbpusd) -> bool:
                 pass
         return False
     _recon["fails"] = 0
-    if pos is None:                            # CONFIRMED closed externally
+    if pos is None:                            # position NOT found -- a single read can be a swallowed API blip.
+        # Require TWO consecutive "no position" reads AND a matching closing transaction before booking a close.
+        # external_close_price() == None means NO closing transaction exists -> EVIDENCE the position did not really
+        # close -> VETO the booking (do NOT fall back to a price estimate). 19 Aug 2026 state-desync fix.
+        _recon["none_streak"] += 1
+        if _recon["none_streak"] < 2:
+            log.warning("reconcile: %s position not found (obs %d/2) -- waiting for a 2nd confirmation before booking.",
+                        GOLD_EPIC, _recon["none_streak"])
+            return False
         deal_id = getattr(stanley.current_trade, "deal_id", None)
-        # P&L ACCURACY (17 Aug 2026): read the ACTUAL close fill from Capital.com history rather than
-        # estimating the exit from the last price feed, so the CSV matches the broker. Fail-safe: fall back
-        # to the estimate if history is unavailable.
         _entry = getattr(stanley.current_trade, "entry_price", None)
         _real = live_executor.external_close_price(ig, GOLD_EPIC, entry_price=_entry)
-        _exit_px = _real if _real is not None else price
-        log.warning("EXTERNAL CLOSE detected: GOLD position gone on Capital.com (deal %s) -- booking at %s%s + FLAT.",
-                    deal_id, _exit_px, "" if _real is not None else " (ESTIMATED -- history unavailable)")
-        trade = stanley.close_trade(_exit_px, "EXTERNAL_CLOSE", gbpusd)
+        if _real is None:                      # VETO: no closing transaction -> not a real close (likely transient)
+            log.warning("reconcile: %s vanished for %d obs but NO closing transaction in history -- NOT booking a "
+                        "close (treating as a transient API blip); keeping the position.", GOLD_EPIC, _recon["none_streak"])
+            return False
+        log.warning("EXTERNAL CLOSE confirmed: %s gone (deal %s) at real fill %s (%d no-position reads + matching "
+                    "txn) -- booking + FLAT.", GOLD_EPIC, deal_id, _real, _recon["none_streak"])
+        _recon["none_streak"] = 0
+        trade = stanley.close_trade(_real, "EXTERNAL_CLOSE", gbpusd)
         if trade is not None:
             account.record_trade(trade.pnl_gbp)
         try:
@@ -333,6 +362,7 @@ def _reconcile_external_close(stanley, account, ig, price, gbpusd) -> bool:
         except Exception:
             pass
         return True
+    _recon["none_streak"] = 0                   # a real position is still there -> reset the streak
     return False
 
 

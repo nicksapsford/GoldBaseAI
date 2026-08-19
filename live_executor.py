@@ -45,6 +45,7 @@ def _reconciliation_start():
 # logs/order_audit.csv. Reconcilable against Capital.com's /history/activity. Never raises -- an audit
 # write must never break trading.
 _AUDIT_FILE = Path(__file__).resolve().parent / "logs" / "order_audit.csv"
+LAST_OPEN = {"outcome": None, "reason": None, "block_deal_id": None}   # place_order records its last outcome for the caller
 _AUDIT_HEADERS = ["ts_utc", "epic", "action", "direction", "size", "stop", "outcome", "deal_id", "mode", "reason"]
 
 
@@ -100,7 +101,10 @@ def existing_position(ig, epic):
     if ig is None or not getattr(ig, "connected", False):
         return "UNKNOWN"
     try:
-        for p in (ig.get_open_positions() or []):
+        positions = ig.get_open_positions()
+        if positions is None:          # API/connection failure -> distinct from a confirmed-empty response
+            return "UNKNOWN"
+        for p in positions:
             if (p.get("market", {}) or {}).get("epic") == epic:
                 return p
         return None
@@ -140,6 +144,7 @@ def place_order(ig, epic, direction, size, stop_pts, take_profit_pts=None):
     `direction` is 'LONG'/'SHORT'. Returns deal_id or None. Fails CLOSED: on any refusal/error returns None
     and the engine stays flat. Every audit row records the account (mode) the order was attributed to."""
     mode = getattr(ig, "account_type", "") or ""
+    LAST_OPEN.update(outcome=None, reason=None, block_deal_id=None)
     if not trading_permitted(ig):
         log.error("ORDER REFUSED: trading not permitted -- no connected Capital.com account -- staying FLAT.")
         _audit(epic, "OPEN", direction, size, stop_pts, outcome="REFUSED", mode=mode, reason="no connected account")
@@ -156,6 +161,8 @@ def place_order(ig, epic, direction, size, stop_pts, take_profit_pts=None):
             log.error("ORDER REFUSED: could not verify existing %s positions -- staying FLAT.", epic)
             _audit(epic, "OPEN", direction, size, stop_pts, outcome="REFUSED", mode=mode, reason="could not verify existing positions")
         else:
+            LAST_OPEN.update(outcome="REFUSED", reason="double-entry",
+                             block_deal_id=(guard.get("position", {}) or {}).get("dealId"))
             log.error("ORDER REFUSED: a %s position is already open -- no double-entry.", epic)
             _audit(epic, "OPEN", direction, size, stop_pts, outcome="REFUSED", mode=mode, reason="double-entry: position already open")
         return None
@@ -416,4 +423,31 @@ def reconcile_alert_gate(mismatches, state_path):
         return "push" if sig != prev else "suppress"
     except Exception as exc:
         log.warning("reconcile_alert_gate failed (%s) -- defaulting to push", exc)
+        return "push"
+
+
+def double_entry_gate(block_deal_id, state_path):
+    """De-dup gate for the double-entry-refused alert (19 Aug 2026), same pattern as reconcile_alert_gate. The guard
+    ALWAYS refuses; this only decides what reaches Nick's phone. Returns 'push' (a NEW/different blocking position),
+    'suppress' (same blocking position as last time -> log only), 'resolved' (was refusing, now clear -> log clean),
+    or 'clean'. Signature = the blocking position's dealId, persisted in state_path (survives restarts)."""
+    import json as _json
+    try:
+        sig = str(block_deal_id or "")
+        prev = ""
+        try:
+            prev = (_json.loads(Path(state_path).read_text(encoding="utf-8")) or {}).get("sig", "")
+        except Exception:
+            prev = ""
+        try:
+            Path(state_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(state_path).write_text(_json.dumps({"sig": sig,
+                "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}), encoding="utf-8")
+        except Exception:
+            pass
+        if not sig:
+            return "resolved" if prev else "clean"
+        return "push" if sig != prev else "suppress"
+    except Exception as exc:
+        log.warning("double_entry_gate failed (%s) -- defaulting to push", exc)
         return "push"

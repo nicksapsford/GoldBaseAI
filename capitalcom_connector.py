@@ -651,7 +651,7 @@ class CapitalComConnector:
             log.error("close_position called but not connected")
             return False
 
-        positions = self.get_open_positions()
+        positions = self.get_open_positions() or []
 
         def _pos_of(p):
             return p.get("position", {}) or {}
@@ -710,19 +710,19 @@ class CapitalComConnector:
             log.error("close_position failed for %s: %s %s", target, exc, body)
             # Re-verify: a broker stop/TP may have closed it underneath us.
             try:
-                if not any(_pos_of(p).get("dealId") == target for p in self.get_open_positions()):
+                if not any(_pos_of(p).get("dealId") == target for p in (self.get_open_positions() or [])):
                     log.info("close_position: %s is gone on re-check -- treating as closed.", target)
                     return True
             except Exception:
                 pass
             return False
 
-    def get_open_positions(self) -> list:
+    def get_open_positions(self):   # -> list | None (None = API/connection failure, NOT confirmed-empty)
         """Return list of currently open positions."""
         self._refresh_session()
 
         if not self._connected:
-            return []
+            return None
         try:
             resp = requests.get(
                 f"{self._base_url}/positions",
@@ -735,7 +735,7 @@ class CapitalComConnector:
             return positions
         except Exception as exc:
             log.error("get_open_positions failed: %s", exc)
-            return []
+            return None   # None = "could not determine" (distinct from [] confirmed-empty)
 
     def get_account_balance(self) -> Optional[float]:
         """Return current account balance."""
@@ -804,7 +804,7 @@ if __name__ == "__main__":
         price = cap.get_price()
         if price:
             log.info("FTSE price: bid=%.1f ask=%.1f mid=%.1f", price["bid"], price["ask"], price["mid"])
-        positions = cap.get_open_positions()
+        positions = cap.get_open_positions() or []
         log.info("Open positions: %d", len(positions))
     else:
         log.warning("Not connected -- check CAPITALCOM_* credentials in .env")
