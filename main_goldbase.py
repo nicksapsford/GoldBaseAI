@@ -52,7 +52,7 @@ from camelot_engine import live_executor
 from camelot_engine import reconciliation
 from camelot_engine import trading_mode
 from pre_checks_gold import run_all_pre_checks, run_individual_pre_checks, check_kill_switch_reset
-from strategy_gold import (should_force_close, get_gbpusd_rate, TIGHT_TRAIL_ACTIVATE_POINTS,
+from strategy_gold import (should_force_close, get_gbpusd_rate, TIGHT_TRAIL_ACTIVATE_POINTS, SPREAD_POINTS,
                            NOTIONAL_CAPITAL, RISK_PCT)
 from camelot_engine import direction_switch
 
@@ -230,7 +230,8 @@ def monitor(feed, stanley, account, ig, now_utc):
     if reconciliation.reconcile_external_close(stanley, account, ig, price, gbpusd, epic=GOLD_EPIC,
                                                live_execution=_LIVE_EXECUTION, system_name="GoldBase",
                                                notify_error=notify_system_error,
-                                               notify_external=notify_external_close):
+                                               notify_external=notify_external_close,
+                                               spread_points=SPREAD_POINTS):
         return   # position closed externally -- booked as EXTERNAL_CLOSE, now FLAT
     if should_force_close(now_utc):
         stanley.close_trade(price, "FORCE_CLOSE_2045", gbpusd)
