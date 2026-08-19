@@ -44,7 +44,7 @@ from paper_trader_gold import PaperTraderGold, TRADES_LOG, LIVE_EXECUTION as _LI
 import live_executor
 import trading_mode
 from pre_checks_gold import run_all_pre_checks, run_individual_pre_checks, check_kill_switch_reset
-from strategy_gold import (should_force_close, get_gbpusd_rate, TIGHT_TRAIL_ACTIVATE_POINTS,
+from strategy_gold import (should_force_close, get_gbpusd_rate, TIGHT_TRAIL_ACTIVATE_POINTS, SPREAD_POINTS,
                            NOTIONAL_CAPITAL, RISK_PCT)
 import direction_switch
 
@@ -344,7 +344,11 @@ def _reconcile_external_close(stanley, account, ig, price, gbpusd) -> bool:
             return False
         deal_id = getattr(stanley.current_trade, "deal_id", None)
         _entry = getattr(stanley.current_trade, "entry_price", None)
-        _real = live_executor.external_close_price(ig, GOLD_EPIC, entry_price=_entry)
+        _ct = stanley.current_trade
+        _real = live_executor.external_close_price(ig, GOLD_EPIC, entry_price=_entry,
+                                                   stake=(getattr(_ct, "size_oz", None) or getattr(_ct, "stake", None)),
+                                                   direction=getattr(_ct, "direction", None),
+                                                   spread_points=SPREAD_POINTS)
         if _real is None:                      # VETO: no closing transaction -> not a real close (likely transient)
             log.warning("reconcile: %s vanished for %d obs but NO closing transaction in history -- NOT booking a "
                         "close (treating as a transient API blip); keeping the position.", GOLD_EPIC, _recon["none_streak"])

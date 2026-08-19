@@ -167,12 +167,20 @@ class PaperTraderGold:
                 return
             with open(TRADES_LOG, encoding="utf-8") as f:
                 lines = f.readlines()
-            if not lines or "account" in lines[0]:
+            if not lines:
                 return
-            lines[0] = lines[0].rstrip() + ",account" + chr(10)
+            want = ",".join(CSV_HEADERS)
+            if lines[0].rstrip("\r\n") == want:
+                return                                  # header already correct -> idempotent no-op
+            # The writer always emits rows in CSV_HEADERS order, only ever appending new columns at the end, so
+            # the header MUST equal CSV_HEADERS. Setting it exactly both migrates a genuine prefix header (appends
+            # the missing columns in the writer's order) AND repairs an already-broken/misordered one (19 Aug 2026:
+            # a header that predated the mae/mfe columns had only ",account" appended -> 16 cols vs 20-col data ->
+            # DictReader read 'account' off a mae value -> account-filtered P&L, the kill-switch daily seed, read 0).
+            lines[0] = want + chr(10)                    # header line ONLY -- data rows are never touched/reordered
             with open(TRADES_LOG, "w", encoding="utf-8", newline="") as f:
                 f.writelines(lines)
-            log.info("Migrated trade CSV header: added the account column.")
+            log.info("Repaired trade CSV header to match CSV_HEADERS (%d columns).", len(CSV_HEADERS))
         except Exception as exc:
             log.warning("account-column migration skipped: %s", exc)
 

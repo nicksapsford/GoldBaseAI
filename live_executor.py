@@ -282,27 +282,25 @@ def close_order(ig, epic, deal_id, direction, size):
     return False
 
 
-def external_close_price(ig, epic, entry_price=None):
-    """Best-effort ACTUAL close fill price from Capital.com /history/transactions, for EXTERNAL_CLOSE trades
-    (a position Nick closed manually) where the engine would otherwise estimate the exit from the last price
-    feed. Returns a TRUE price (float) or None -> the caller falls back to the estimate. Read-only; never raises.
-
-    Matching: prefer the transaction whose openLevel matches `entry_price` (each position has a unique entry);
-    else the most recent transaction for this instrument that carries a close level. Levels come back in the
-    broker's quote units, so we divide by the epic's scale divisor to get the TRUE price (no-op on demo)."""
+def external_close_price(ig, epic, entry_price=None, stake=None, direction=None, spread_points=0.0):
+    """The ACTUAL exit price for an EXTERNAL_CLOSE, DERIVED from the REAL realised P&L Capital.com reports.
+    (19 Aug 2026 rewrite.) This API's /history/transactions returns, for a closed trade, `size` = the realised
+    P&L in the account currency + note "Trade closed" -- it does NOT return open/close LEVELS, so the old
+    openLevel/closeLevel matching found nothing and the caller silently estimated from a stale price feed
+    (understating by 48-77% in the wild). We now take the newest RECENT (<=15 min) closed-trade transaction for
+    this instrument, read its real P&L, and derive the exit that reproduces that EXACT figure through the engine's
+    own price->P&L formula (pnl = (points - spread) * stake  ->  exit = entry +/- (pnl/stake + spread)), so
+    close_trade() books the REAL P&L. Returns a float exit, or None -> the caller VETOES (no real closing txn yet
+    visible -> retry next cycle; never a stale estimate). Read-only; never raises."""
     try:
         import requests
         from datetime import timedelta
-        frm = (datetime.now(timezone.utc) - timedelta(hours=8)).strftime("%Y-%m-%dT%H:%M:%S")
+        if stake in (None, 0) or direction not in ("LONG", "SHORT") or entry_price is None:
+            return None                                  # cannot derive without the trade's own params
+        frm = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S")
         r = requests.get("%s/history/transactions?from=%s" % (ig._base_url, frm), headers=ig._headers(), timeout=10)
         if r.status_code != 200:
             return None
-        try:
-            div = float(ig.price_divisor(epic))
-        except Exception:
-            div = 1.0
-        if not div:
-            div = 1.0
 
         def _f(v):
             try:
@@ -310,26 +308,35 @@ def external_close_price(ig, epic, entry_price=None):
             except (TypeError, ValueError):
                 return None
 
-        txns = (r.json().get("transactions", []) or [])   # Capital.com returns newest-first
-        fallback = None
-        for t in txns:
-            cl = _f(t.get("closeLevel"))
-            if cl in (None, 0.0):
+        want = str(epic).upper().replace(" ", "")
+        now = datetime.now(timezone.utc)
+        for t in (r.json().get("transactions", []) or []):        # newest-first
+            if t.get("transactionType") != "TRADE":
                 continue
-            true_close = round(cl / div, 6)
-            ol = _f(t.get("openLevel"))
-            if entry_price is not None and ol is not None:
-                true_open = ol / div
-                tol = max(0.5, abs(float(entry_price)) * 0.002)
-                if abs(true_open - float(entry_price)) <= tol:
-                    return true_close                       # exact position match
-            if fallback is None:
-                fallback = true_close                       # newest close for this account as a backstop
-        return fallback
-    except Exception as exc:
-        log.warning("external_close_price(%s) failed: %s -- caller will estimate.", epic, exc)
+            if "clos" not in str(t.get("note") or "").lower():     # closed-trade rows only, not opens
+                continue
+            inst = str(t.get("instrumentName") or "").upper().replace(" ", "")
+            if inst and want and want not in inst and inst not in want:
+                continue                                            # a different instrument -> skip
+            try:                                                    # recency: the close we're booking is fresh
+                tdt = datetime.strptime((t.get("dateUtc") or "")[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+                if (now - tdt).total_seconds() > 900:
+                    return None                                     # newest close is stale -> no fresh match (veto/retry)
+            except Exception:
+                pass
+            real_pnl = _f(t.get("size"))                            # `size` = realised P&L in the account currency (GBP)
+            if real_pnl is None:
+                continue
+            points = real_pnl / float(stake)                        # net points that produced this P&L
+            raw = points + float(spread_points)                     # add back the spread close_trade will re-subtract
+            exit_px = float(entry_price) + raw if direction == "LONG" else float(entry_price) - raw
+            log.info("external_close: matched real P&L GBP %.2f (txn size) -> derived exit %.4f for %s.",
+                     real_pnl, exit_px, epic)
+            return round(exit_px, 4)
         return None
-
+    except Exception as exc:
+        log.warning("external_close_price(%s) failed: %s -- caller will VETO the close.", epic, exc)
+        return None
 
 def reconcile_orders(ig, epic, hours=24):
     """AUTOMATED order reconciliation: compare our audit log's ACCEPTED opens against Capital.com's
