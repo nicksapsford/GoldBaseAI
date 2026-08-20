@@ -38,7 +38,7 @@ from notifier_gold import (
     notify_system_startup, notify_trade_opened,
     notify_trade_closed_win, notify_trade_closed_loss, notify_system_error,
     notify_two_speed_activated, notify_external_close, notify_margin_rejection,
-    notify_kill_switch_triggered, notify_reconcile_clear,
+    notify_kill_switch_triggered, notify_reconcile_clear, notify_position_adopted,
 )
 from paper_trader_gold import PaperTraderGold, TRADES_LOG, LIVE_EXECUTION as _LIVE_EXECUTION
 import live_executor
@@ -611,7 +611,19 @@ def main() -> None:
     # ── STAGE B: attach the connector so Stanley can place/close REAL demo orders, then reconcile any
     # restored open position against Capital.com (so a restart never leaves us managing a phantom). ──
     stanley.ig = ig    # pass the connector object always; it self-heals a failed startup connect
-    stanley.reconcile_live_position()
+    _adopt = stanley.reconcile_live_position()   # phantom guard AND orphan-position adoption (Rule 12)
+    if _adopt and _adopt.get("adopted"):
+        try:
+            notify_position_adopted(_adopt["direction"], _adopt["entry_price"], _adopt["stop_loss"],
+                                    _adopt.get("take_profit"), _adopt.get("stake", 0.0))
+        except Exception:
+            pass
+    elif _adopt and _adopt.get("aborted"):
+        try:
+            notify_system_error("GoldBase: found an open broker position on startup but could NOT read its "
+                                "stop/entry -- NOT adopted, engine staying flat. Manual check needed.")
+        except Exception:
+            pass
     if _LIVE_EXECUTION:
         log.warning("*** STAGE B LIVE EXECUTION ON -- REAL demo orders will be placed on the "
                     "Capital.com %s account. ***", (ig.account_type if ig_connected else "?"))

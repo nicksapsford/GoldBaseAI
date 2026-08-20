@@ -113,6 +113,57 @@ def existing_position(ig, epic):
         return "UNKNOWN"
 
 
+def read_open_position(ig, epic):
+    """Read Capital.com's CURRENT open position for `epic`, normalised to TRUE prices/size, for ADOPTING an
+    orphaned position on startup (engine flat / no state file, but a real position is open on the broker).
+    Distinct from existing_position() (raw dict): hands back exactly what the engine needs to resume SAFE
+    management, already un-scaled.
+    Returns:
+      "UNKNOWN"  -> could not check (ig missing/disconnected or API error) -- caller MUST NOT adopt; retry.
+      None       -> confirmed: no open position for this epic.
+      dict       -> {direction, entry_price, size, stop_loss, take_profit, deal_id, opened, raw_keys}, TRUE units.
+                    stop_loss / take_profit are None if the broker reports none set.
+    Never raises -- any parse problem returns "UNKNOWN" so we never adopt on a half-understood response."""
+    pos = existing_position(ig, epic)
+    if pos is None or pos == "UNKNOWN":
+        return pos
+    try:
+        p = pos.get("position", {}) or {}
+        raw_dir = str(p.get("direction", "")).upper()
+        if raw_dir == "BUY":
+            direction = "LONG"
+        elif raw_dir == "SELL":
+            direction = "SHORT"
+        else:
+            log.warning("read_open_position(%s): unrecognised direction %r -- treating as UNKNOWN.", epic, raw_dir)
+            return "UNKNOWN"
+
+        def _norm(v):
+            return ig.normalise_price(epic, v) if v not in (None, "") else None
+
+        # Capital.com position READ fields: entry = "level"; stop = "stopLevel"; take-profit = "limitLevel"
+        # (with "profitLevel" as the write-side alias -- read defensively so we survive either). Levels come
+        # back in the broker quote scale -> normalise to TRUE prices. raw_keys is logged on adoption so the
+        # exact live schema is always verifiable from the log.
+        entry = _norm(p.get("level"))
+        stop  = _norm(p.get("stopLevel"))
+        _tp_raw = p.get("limitLevel")
+        if _tp_raw in (None, ""):
+            _tp_raw = p.get("profitLevel")
+        tp = _norm(_tp_raw)
+        try:
+            size = abs(float(p.get("size"))) * float(ig.price_divisor(epic))   # broker size -> TRUE size
+        except (TypeError, ValueError, ZeroDivisionError):
+            size = None
+        return {"direction": direction, "entry_price": entry, "size": size,
+                "stop_loss": stop, "take_profit": tp, "deal_id": p.get("dealId"),
+                "opened": p.get("createdDateUTC") or p.get("createdDate"),
+                "raw_keys": sorted(p.keys())}
+    except Exception as exc:
+        log.warning("read_open_position(%s) failed: %s -- treating as UNKNOWN (will not adopt).", epic, exc)
+        return "UNKNOWN"
+
+
 def position_pnl(ig, epic):
     """Return the LIVE unrealised P&L (Capital.com 'upl') for the open `epic` position, or None.
     Used to show the REAL floating P&L on the dashboard (Stage B TEST 2)."""
