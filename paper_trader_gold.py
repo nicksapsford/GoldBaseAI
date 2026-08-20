@@ -15,7 +15,7 @@ from typing import Optional
 import pandas as pd
 
 from strategy_gold import GoldTrade, TRAILING_STOP_POINTS, DEFAULT_GBPUSD, TAKE_PROFIT_POINTS
-from camelot_engine.live_executor import place_order, close_order, existing_position, sync_stop
+from camelot_engine.live_executor import place_order, close_order, existing_position, sync_stop, read_open_position
 from camelot_engine import trading_mode
 
 log = logging.getLogger("GoldTrader.Stanley")
@@ -33,6 +33,30 @@ LOG_DIR      = Path(__file__).parent / "logs"
 TRADES_LOG   = LOG_DIR / "gold_trades.csv"
 SUMMARY_LOG  = LOG_DIR / "gold_summary.txt"
 STATE_FILE   = LOG_DIR / "stanley_gold_state.json"
+
+
+def _parse_opened(s):
+    """Parse a Capital.com createdDate(UTC) string to a UTC datetime for an adopted position; a missing or
+    unparseable value falls back to now(UTC) -- the timestamp is used only for duration display, never for
+    stops/exits, so 'now' is a safe default."""
+    if not s:
+        return datetime.now(timezone.utc)
+    try:
+        dt = datetime.fromisoformat(str(s).replace("Z", "").strip()[:26])
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+    except Exception:
+        return datetime.now(timezone.utc)
+
+CSV_HEADERS = [
+    "date", "time", "direction",
+    "entry_price_usd", "exit_price_usd",
+    "stake_per_point", "points_gained", "pnl_usd", "pnl_gbp", "gbpusd_rate",
+    "exit_reason", "capital_after_gbp",
+    "entry_time", "exit_time", "liquidity_period",
+    "mae_pts", "mae_gbp", "mfe_pts", "mfe_gbp",
+    "account",   # ACCOUNT ISOLATION (17 Aug 2026): DEMO / LIVE -- which real account this trade was on
+]
+
 
 CSV_HEADERS = [
     "date", "time", "direction",
@@ -294,11 +318,16 @@ class PaperTraderGold:
             return None
 
     def reconcile_live_position(self):
-        """Stage B restart safety -- engine calls this once after attaching the connector. If we
-        restored an OPEN trade but Capital.com has no matching position (broker stop/TP fired while we
-        were down, or it never really opened), discard the stale state so we never manage a phantom."""
-        if not (LIVE_EXECUTION and self.ig is not None and self.in_trade):
-            return
+        """Stage B restart safety -- the engine calls this ONCE after attaching the connector. Two mismatches
+        to reconcile against Capital.com's real positions (Rule 12: query the broker directly, never trust the
+        state file alone):
+          * engine FLAT but the broker has a position -> ADOPT it (orphan-position recovery, 20 Aug 2026).
+          * engine IN a trade but the broker has none  -> discard the stale state (phantom guard).
+        Returns an adoption-result dict when it adopts (so the engine can fire ONE notification), else None."""
+        if not (LIVE_EXECUTION and self.ig is not None):
+            return None
+        if not self.in_trade:
+            return self._adopt_orphan_position()
         deal_id = getattr(self.current_trade, "deal_id", None)
         pos = existing_position(self.ig, LIVE_EPIC)
         if pos is None:
@@ -311,6 +340,62 @@ class PaperTraderGold:
             log.warning("RECONCILE: could not verify %s position on startup -- retry next cycle.", LIVE_EPIC)
         else:
             log.info("RECONCILE: live %s position confirmed open (deal_id=%s).", LIVE_EPIC, deal_id)
+        return None
+
+    def _adopt_orphan_position(self):
+        """Engine is FLAT (no state) but a real position may be open on Capital.com -- e.g. after a restart or
+        crash while in a trade (or a deliberate restart during a promotion). Adopt the broker's ACTUAL values
+        as ground truth and resume SAFE management. Critically: the broker's stop/TP are taken AS-IS (a
+        manually-adjusted stop is RESPECTED, never recomputed), and trail_best is seeded from the CURRENT price
+        so the trail can only ever react to NEW extremes after adoption -- it can never push an adopted
+        (possibly hand-tightened) stop backward on the next sync_stop cycle."""
+        info = read_open_position(self.ig, LIVE_EPIC)
+        if info == "UNKNOWN":
+            log.warning("ADOPT: could not verify %s position on startup -- retry next cycle.", LIVE_EPIC)
+            return None
+        if info is None:
+            return None                                   # genuinely flat -- normal startup, no change
+        log.warning("ADOPT: broker has an open %s position but the engine is FLAT -- adopting. broker keys=%s",
+                    LIVE_EPIC, info.get("raw_keys"))
+        # SAFETY GATE: never manage on a stop/entry/direction we could not read -- adopting then would force a
+        # freshly-recomputed (possibly LOOSER) stop onto the broker. Abort + alert instead; stay flat.
+        if info.get("stop_loss") is None or info.get("entry_price") is None or info.get("direction") is None:
+            log.error("ADOPT ABORTED: broker %s position missing entry/stop/direction "
+                      "(entry=%s stop=%s dir=%s) -- NOT adopting, staying flat. Manual check needed.",
+                      LIVE_EPIC, info.get("entry_price"), info.get("stop_loss"), info.get("direction"))
+            return {"aborted": True, "reason": "unreadable entry/stop/direction"}
+        # current TRUE price for the trail seed; fall back to the broker stop level (per brief) if the quote fails
+        cur_price = None
+        try:
+            q = self.ig.get_price(LIVE_EPIC)
+            if q and q.get("mid") is not None:
+                cur_price = float(q["mid"])
+        except Exception as exc:
+            log.warning("ADOPT: current-price read failed (%s) -- seeding the trail from the broker stop.", exc)
+        if cur_price is None:
+            cur_price = float(info["stop_loss"])
+        size = float(info["size"]) if info.get("size") else 0.0
+        trade = GoldTrade(direction=info["direction"], entry_price=float(info["entry_price"]),
+                          stop_pts=TRAILING_STOP_POINTS, size_oz=size, gbpusd_entry=self._gbpusd,
+                          entry_time=_parse_opened(info.get("opened")))
+        # OVERRIDE __post_init__'s fresh recompute with the broker's ground truth (respect the manual stop/TP).
+        trade.stop_loss = float(info["stop_loss"])
+        if info.get("take_profit"):
+            trade.take_profit = float(info["take_profit"])
+        if size > 0:
+            trade.size_oz = size
+            trade.stake   = round(size, 4)
+        trade.deal_id    = info.get("deal_id")
+        trade.trail_best = cur_price                       # seed = current price -> trail only reacts to NEW extremes
+        self.current_trade = trade
+        self._bal_at_open  = self._real_balance()
+        self._save_state()
+        log.warning("ADOPTED %s %s: entry=%.2f stop=%.2f TP=%s size=%.4f deal=%s trail_best=%.2f",
+                    LIVE_EPIC, trade.direction, trade.entry_price, trade.stop_loss,
+                    ("%.2f" % trade.take_profit) if trade.take_profit else "None",
+                    trade.stake, trade.deal_id, trade.trail_best)
+        return {"adopted": True, "direction": trade.direction, "entry_price": trade.entry_price,
+                "stop_loss": trade.stop_loss, "take_profit": trade.take_profit, "stake": trade.stake}
 
     def open_trade(self, direction: str, price: float, gbpusd: float,
                    liquidity_period: str = "") -> Optional[GoldTrade]:

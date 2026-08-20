@@ -49,6 +49,19 @@ def notify_trade_opened(direction, entry_price, stop_loss, take_profit, stake,
     )
 
 
+def notify_position_adopted(direction, entry_price, stop_loss, take_profit, stake=0.0) -> None:
+    """Orphan-position adoption on startup (20 Aug 2026): the engine came up flat but a real position was
+    open on the broker, so we resumed managing it. A meaningful event -> visible, not silent."""
+    _send(
+        "%s — position ADOPTED on startup 🔄" % SYS,
+        "Resumed managing an existing broker position.\n%s | Entry: %s | Stop: %s | TP: %s%s" % (
+            direction, _px(entry_price), _px(stop_loss),
+            _px(take_profit) if take_profit else "—",
+            ("\nStake: £%.2f/pt" % stake) if stake else ""),
+        _prio(_P_NORMAL, _P_HIGH),
+    )
+
+
 def notify_trade_closed_win(direction, exit_price, points_gained, pnl_gbp,
                             capital, reason, pot=None, duration=None) -> None:
     dur = _dur(duration)
