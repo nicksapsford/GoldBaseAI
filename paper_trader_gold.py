@@ -58,6 +58,30 @@ CSV_HEADERS = [
 ]
 
 
+def _real_close_fill(ig, epic, trade, tries=3, delay=2.0):
+    """Read the ACTUAL closing-transaction fill for an engine-initiated LIVE close, reusing
+    live_executor.external_close_price() -- the real-P&L-derived exit already built + proven for
+    EXTERNAL_CLOSE (19 Aug). The closing txn appears a moment after the close order, so retry briefly.
+    Returns a float exit price, or None -> the caller falls back to the feed estimate + alerts.
+    Read-only; never raises."""
+    try:
+        import time as _t
+        import live_executor
+        from strategy_gold import SPREAD_POINTS
+        stake = getattr(trade, "size_oz", None) or getattr(trade, "stake", None)
+        for k in range(tries):
+            px = live_executor.external_close_price(
+                ig, epic, entry_price=getattr(trade, "entry_price", None),
+                stake=stake, direction=getattr(trade, "direction", None), spread_points=SPREAD_POINTS)
+            if px is not None:
+                return px
+            if k < tries - 1:
+                _t.sleep(delay)
+    except Exception as exc:
+        log.warning("_real_close_fill(%s) failed: %s -- caller falls back to the estimate.", epic, exc)
+    return None
+
+
 class PaperTraderGold:
     """Stanley -- paper trading accountant for Gold spread bets."""
 
@@ -484,6 +508,25 @@ class PaperTraderGold:
         deal_id = getattr(self.current_trade, "deal_id", None)
         if LIVE_EXECUTION and self.ig is not None and deal_id:
             close_order(self.ig, LIVE_EPIC, deal_id, self.current_trade.direction, self.current_trade.size_oz)
+            # REAL-FILL BOOKING (20 Aug 2026): book P&L from the ACTUAL closing transaction, not the feed
+            # estimate -- the SAME class of fix external_close_price() applied to EXTERNAL_CLOSE. FORCE_CLOSE_2045
+            # (the only always-engine-initiated market close) was understating ~£12 on the first force-close
+            # since that fix. Covers every engine-initiated market close. EXCLUDES: EXTERNAL_CLOSE (the caller
+            # already passes the real fill) and STOP_LOSS (keeps the deliberate Job-10 stop-level clamp above).
+            # Falls back to the feed estimate + alerts if the closing txn isn't visible in time (audit reconciles).
+            if reason not in ("EXTERNAL_CLOSE", "STOP_LOSS"):
+                _real = _real_close_fill(self.ig, LIVE_EPIC, self.current_trade)
+                if _real is not None:
+                    price = _real
+                else:
+                    log.warning("%s: real closing-fill txn not visible in time -- booking feed estimate %.4f "
+                                "(order-audit will reconcile).", reason, price)
+                    try:
+                        from notifier_gold import notify_system_error
+                        notify_system_error("GoldBase %s booked a FEED ESTIMATE (real closing txn not visible "
+                                            "yet) -- verify this trade's P&L against the broker." % reason)
+                    except Exception:
+                        pass
         from strategy_gold import close_trade
         trade = close_trade(self.current_trade, price, reason, rate)
         self.capital_gbp = round(self.capital_gbp + trade.pnl_gbp, 2)
