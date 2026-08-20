@@ -169,17 +169,22 @@ def _on_close(stanley, account, price, reason):
     except Exception:
         _dur = None
     _pot = reconciliation.last_balance()   # last-known real Capital.com balance (cached, no extra call)
+    # Display the trade's ACTUAL booked exit (real fill for a live close), not the caller's feed estimate,
+    # so the notification/log agree with the real-fill P&L booked in close_trade (20 Aug 2026).
+    _disp = getattr(trade, "exit_price", None)
+    if _disp is None:
+        _disp = price
     try:
         if trade.pnl_gbp >= 0:
-            notify_trade_closed_win(trade.direction, price, trade.points_gained,
+            notify_trade_closed_win(trade.direction, _disp, trade.points_gained,
                                     trade.pnl_gbp, account.capital_gbp, reason, pot=_pot, duration=_dur)
         else:
-            notify_trade_closed_loss(trade.direction, price, trade.points_gained,
+            notify_trade_closed_loss(trade.direction, _disp, trade.points_gained,
                                      trade.pnl_gbp, account.capital_gbp, reason, pot=_pot, duration=_dur)
     except Exception as exc:
         log.warning("Percival close notify failed: %s", exc)
     log.info("CLOSED %s @ $%.2f | %s | pts=%+.2f | P&L=£%+.2f | capital=£%.2f",
-             trade.direction, price, reason, trade.points_gained, trade.pnl_gbp, account.capital_gbp)
+             trade.direction, _disp, reason, trade.points_gained, trade.pnl_gbp, account.capital_gbp)
 
 
 def _maybe_notify_two_speed(trade) -> None:
@@ -363,6 +368,30 @@ def push_dashboard(stanley, account, mode, ig=None):
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
+def _reconcile_and_adopt(stanley, where):
+    """Rule 14: run orphan-position reconciliation at EVERY transition onto the active broker account --
+    process startup AND a DEMO->LIVE account switch -- reusing reconcile_live_position() exactly as built
+    and tested. Fires ONE adoption/abort notification. Idempotent + safe: genuinely flat, or paper mode,
+    -> harmless no-op. Never raises."""
+    try:
+        res = stanley.reconcile_live_position()
+    except Exception as exc:
+        log.warning("reconcile/adopt (%s) failed: %s", where, exc)
+        return
+    if res and res.get("adopted"):
+        try:
+            notify_position_adopted(res["direction"], res["entry_price"], res["stop_loss"],
+                                    res.get("take_profit"), res.get("stake", 0.0))
+        except Exception:
+            pass
+    elif res and res.get("aborted"):
+        try:
+            notify_system_error("GoldBase: found an open broker position on %s but could NOT read its "
+                                "stop/entry -- NOT adopted, engine staying flat. Manual check needed." % where)
+        except Exception:
+            pass
+
+
 def _sync_account(ig, stanley, account=None):
     """Follow the DEMO/LIVE switch. If trading_mode changed and we are FLAT, re-point the connector at the
     selected Capital.com account (reconnects). NEVER switches accounts while a position is open -- that
@@ -381,6 +410,12 @@ def _sync_account(ig, stanley, account=None):
             log.warning("ACCOUNT SWITCHED to %s (trading_mode=%s)", ig.account_type, desired)
             if account is not None:
                 account.reset_for_account_switch(ig.account_type, TRADES_LOG)   # isolate: clean state per account
+            # Rule 14 -- LIVE-transition adoption (20 Aug 2026): the flip onto LIVE is a transition onto broker
+            # truth, exactly like startup. Re-verify so a real position already open on LIVE is ADOPTED, not
+            # left flat-on-live (Rule 13 forces DEMO on every reboot, so the flip is where a pre-existing live
+            # position first becomes visible). Only on the ->LIVE direction.
+            if ig.account_type == "LIVE":
+                _reconcile_and_adopt(stanley, "the DEMO->LIVE switch")
         else:
             log.warning("ACCOUNT SWITCH to %s refused (credentials not configured?) -- staying on %s",
                         desired, ig.account_type)
@@ -414,19 +449,7 @@ def main() -> None:
     # ── STAGE B: attach the connector so Stanley can place/close REAL demo orders, then reconcile any
     # restored open position against Capital.com (so a restart never leaves us managing a phantom). ──
     stanley.ig = ig    # pass the connector object always; it self-heals a failed startup connect
-    _adopt = stanley.reconcile_live_position()   # phantom guard AND orphan-position adoption (Rule 12)
-    if _adopt and _adopt.get("adopted"):
-        try:
-            notify_position_adopted(_adopt["direction"], _adopt["entry_price"], _adopt["stop_loss"],
-                                    _adopt.get("take_profit"), _adopt.get("stake", 0.0))
-        except Exception:
-            pass
-    elif _adopt and _adopt.get("aborted"):
-        try:
-            notify_system_error("GoldBase: found an open broker position on startup but could NOT read its "
-                                "stop/entry -- NOT adopted, engine staying flat. Manual check needed.")
-        except Exception:
-            pass
+    _reconcile_and_adopt(stanley, "startup")   # phantom guard AND orphan-position adoption (Rule 12/14)
     if _LIVE_EXECUTION:
         log.warning("*** STAGE B LIVE EXECUTION ON -- REAL demo orders will be placed on the "
                     "Capital.com %s account. ***", (ig.account_type if ig_connected else "?"))
