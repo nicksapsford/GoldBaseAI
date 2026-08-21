@@ -389,13 +389,16 @@ def external_close_price(ig, epic, entry_price=None, stake=None, direction=None,
         log.warning("external_close_price(%s) failed: %s -- caller will VETO the close.", epic, exc)
         return None
 
-def reconcile_orders(ig, epic, hours=24):
+def reconcile_orders(ig, epic, hours=24, match_window_s=300):
     """AUTOMATED order reconciliation: compare our audit log's ACCEPTED opens against Capital.com's
     /history/activity for `epic` over the last `hours`. Returns a list of mismatch strings (empty = clean):
       * AUDIT_ONLY  -- we recorded an ACCEPTED open that Capital.com has NO matching POSITION ACCEPTED for
                        (we think we opened, the broker didn't -> a would-be phantom)
       * BROKER_ONLY -- Capital.com opened a position we have NO audit row for (an untracked order)
-    Matched by timestamp within +/-2 min (one epic per system, opens are infrequent). Read-only; never raises."""
+    Matched by timestamp within +/- match_window_s (default 5 min). The engine only NOTICES a broker-side
+    close on its next monitor cycle, so this lag is inherent, not exceptional (real cases ran 2m04s / 2m05s,
+    past the old +/-2 min) -- the window must absorb it; the outer bound still catches a genuinely missing
+    record. Pass ~2x the monitor interval if that interval ever exceeds ~2.5 min. Read-only; never raises."""
     from datetime import timedelta
     mismatches = []
     try:
@@ -411,12 +414,17 @@ def reconcile_orders(ig, epic, hours=24):
                         continue
                     if audit_earliest is None or t < audit_earliest:
                         audit_earliest = t
-                    if r.get("epic") != epic or r.get("outcome") != "ACCEPTED" or t < cutoff:
+                    if r.get("epic") != epic or t < cutoff:
                         continue
-                    act = r.get("action")
-                    if act == "OPEN":
+                    act = r.get("action"); outcome = r.get("outcome")
+                    # OPEN counts only if genuinely ACCEPTED (a refused open is NOT a real position). CLOSE counts
+                    # when ACCEPTED *or* ALREADY_CLOSED: a broker TP fires first, so the engine's own close lands
+                    # as ALREADY_CLOSED -- that still means "we accounted for this close" and must NOT read as a
+                    # BROKER_ONLY. (21 Aug 2026 fix: the old outcome!=ACCEPTED pre-filter dropped ALREADY_CLOSED
+                    # before the action was even checked, defeating the intent stated in the comment below.)
+                    if act == "OPEN" and outcome == "ACCEPTED":
                         ours_open.append(t); ours_all.append(t)
-                    elif act == "CLOSE":
+                    elif act == "CLOSE" and outcome in ("ACCEPTED", "ALREADY_CLOSED"):
                         ours_all.append(t)          # closes count too, so a broker CLOSE is not a false BROKER_ONLY
         if audit_earliest is None:
             return mismatches   # audit log empty -> nothing to reconcile (do not false-flag pre-audit orders)
@@ -439,7 +447,7 @@ def reconcile_orders(ig, epic, hours=24):
         else:
             log.warning("reconcile_orders(%s): activity query HTTP %s -- skipping this run.", epic, resp.status_code)
             return mismatches
-        WIN = 120.0
+        WIN = float(match_window_s)
         for t in ours_open:
             if not any(abs((t - bt).total_seconds()) <= WIN for bt in broker):
                 mismatches.append("AUDIT_ONLY: recorded ACCEPTED %s open at %sZ has NO Capital.com POSITION ACCEPTED"
