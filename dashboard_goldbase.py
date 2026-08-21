@@ -44,7 +44,7 @@ if ENV_LABEL == "LIVE":
 else:
     _ENV_BADGE = ('<span style="background:#3a2f00;color:#e0b020;border:1px solid #6b5600;border-radius:5px;'
                   'padding:3px 10px;font-size:11px;font-weight:700;letter-spacing:1px;">TEST &mdash; Dell</span>')
-PORT = 5033
+PORT = int(os.getenv("PORT", "5033"))   # env-configurable so an isolated test instance can bind e.g. 5060
 
 logging.basicConfig(level=logging.WARNING)
 logging.Formatter.converter = time.gmtime

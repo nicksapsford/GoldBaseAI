@@ -73,7 +73,7 @@ logging.basicConfig(level=logging.INFO,
 logging.Formatter.converter = time.gmtime
 log = logging.getLogger("GoldBase")
 
-PORT = 5033
+PORT = int(_seam_os.getenv("PORT", "5033"))   # env-configurable so an isolated test instance can bind e.g. 5060
 DASHBOARD_URL = "http://localhost:%d/api/update" % PORT
 PAPER_TRADING_MODE = True
 CANDLE_SECONDS = 300
